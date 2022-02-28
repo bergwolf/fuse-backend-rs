@@ -5,8 +5,7 @@ build:
 	cargo build --features="virtiofs"
 	cargo build --features="vhost-user-fs"
 
-build-macos:
-	cargo build --features="fusedev"
+build-macos: build
 
 check-macos: build-macos
 	cargo fmt -- --check
