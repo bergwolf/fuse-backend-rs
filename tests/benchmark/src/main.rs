@@ -10,7 +10,9 @@
 //! [--max-write BYTES] [--passthrough]`
 //!
 //! - default (sync) mode: requests are served by `N` worker threads, each
-//!   reading from its own fuse channel (the classic multi-threaded design).
+//!   doing blocking reads on its own fuse device fd cloned with
+//!   `FUSE_DEV_IOC_CLONE` (`FuseSession::new_blocking_channel()`), which
+//!   saves the `epoll_wait` syscall per request of `new_channel()`.
 //! - `--async` mode: requests are served by `N` asynchronous workers
 //!   (`AsyncFuseServing`), each running a `FuseDevTask` on its own async
 //!   runtime (tokio-uring when io_uring is available) and its own
@@ -46,8 +48,8 @@ mod daemon {
     use fuse_backend_rs::api::{Vfs, VfsOptions};
     use fuse_backend_rs::passthrough::{Config, PassthroughFs};
     use fuse_backend_rs::transport::{
-        AsyncFuseServing, AsyncServingConfig, FuseBackingRegistry, FuseChannel, FuseSession,
-        UringConfig, UringFuseServing,
+        AsyncFuseServing, AsyncServingConfig, BlockingFuseChannel, FuseBackingRegistry,
+        FuseSession, UringConfig, UringFuseServing,
     };
 
     struct Args {
@@ -160,7 +162,7 @@ mod daemon {
 
     struct FuseServer {
         server: Arc<Server<Arc<Vfs>>>,
-        ch: FuseChannel,
+        ch: BlockingFuseChannel,
     }
 
     impl FuseServer {
@@ -199,7 +201,7 @@ mod daemon {
         for _ in 0..thread_cnt {
             let mut worker = FuseServer {
                 server: server.clone(),
-                ch: se.new_channel().unwrap(),
+                ch: se.new_blocking_channel().unwrap(),
             };
             thread::Builder::new()
                 .name("fuse_server".to_string())
@@ -212,8 +214,9 @@ mod daemon {
 
         let mut signals = Signals::new(TERM_SIGNALS).unwrap();
         signals.forever().next();
+        // Blocking channels are not woken by `FuseSession::wake()`: umounting
+        // makes their pending reads fail with ENODEV, which ends the workers.
         se.umount().unwrap();
-        se.wake().unwrap();
     }
 
     /// Serve requests with `thread_cnt` asynchronous workers until a

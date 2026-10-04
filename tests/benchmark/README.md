@@ -48,7 +48,8 @@ cargo bench --bench dispatch_microbench
 ## 2. End-to-end comparison with fio
 
 `tests/scripts/bench_sync_async.sh` mounts the `fuse-backend-rs-benchmark`
-daemon once per mode — sync mode (N worker threads, one fuse channel each),
+daemon once per mode — sync mode (N worker threads, each blocking on its own
+cloned fuse device fd, see `FuseSession::new_blocking_channel()`),
 async mode (N asynchronous workers through `AsyncFuseServing`, each with
 its own `/dev/fuse` file description and async runtime, tokio-uring when
 io_uring is available) and uring mode (the experimental

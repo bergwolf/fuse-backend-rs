@@ -154,6 +154,13 @@ impl FuseServer {
 }
 ```
 
+`FuseChannel` waits for requests with `epoll`, so that `FuseSession::wake()`
+can stop the service threads. For throughput, serve each thread from
+`FuseSession::new_blocking_channel()` instead (same `get_request()` loop): it
+reads its own cloned fuse device fd with plain blocking reads, which saves an
+`epoll_wait` syscall per request; the threads then exit when the session is
+umounted.
+
 ## License
 This project is licensed under
 - [Apache License](http://www.apache.org/licenses/LICENSE-2.0), Version 2.0

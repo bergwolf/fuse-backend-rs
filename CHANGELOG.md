@@ -101,6 +101,9 @@
   `readv`/`preadv`, which saves a heap allocation per read/write request. The
   dispatch micro-benchmark gains file-backed `read_4k_file`/`write_4k_file`
   cases to cover that path.
+- [3](https://github.com/bergwolf/fuse-backend-rs/pull/3): The benchmark daemon serves the sync mode from
+  `FuseSession::new_blocking_channel()`, saving the `epoll_wait` syscall per
+  request of `new_channel()`.
 
 ### Removed
 - [254](https://github.com/cloud-hypervisor/fuse-backend-rs/pull/254): Drop the vestigial `vhost` and `virtio-bindings` dependencies that the
