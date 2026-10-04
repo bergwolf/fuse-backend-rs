@@ -403,14 +403,15 @@ impl<S: BitmapSlice + Send + Sync + 'static> AsyncFileSystem for PassthroughFs<S
         flags: u32,
         fuse_flags: u32,
     ) -> io::Result<(Option<<Self as FileSystem>::Handle>, OpenOptions)> {
+        // The async API can't reply with a passthrough backing file id.
         async_relay!(
             self,
             ctx,
             [],
-            self.open(ctx, inode, flags, fuse_flags)
+            self.open_impl(inode, flags, fuse_flags, false)
                 .map(|(handle, opts, _)| (handle, opts)),
-            move |fs: Arc<Self>, ctx: Context| {
-                fs.open(&ctx, inode, flags, fuse_flags)
+            move |fs: Arc<Self>, _ctx: Context| {
+                fs.open_impl(inode, flags, fuse_flags, false)
                     .map(|(handle, opts, _)| (handle, opts))
             }
         )
@@ -423,14 +424,15 @@ impl<S: BitmapSlice + Send + Sync + 'static> AsyncFileSystem for PassthroughFs<S
         name: &CStr,
         args: CreateIn,
     ) -> io::Result<(Entry, Option<<Self as FileSystem>::Handle>, OpenOptions)> {
+        // The async API can't reply with a passthrough backing file id.
         async_relay!(
             self,
             ctx,
             [let name = name.to_owned();],
-            self.create(ctx, parent, name, args)
+            self.create_impl(ctx, parent, name, args, false)
                 .map(|(entry, handle, opts, _)| (entry, handle, opts)),
             move |fs: Arc<Self>, ctx: Context| {
-                fs.create(&ctx, parent, &name, args)
+                fs.create_impl(&ctx, parent, &name, args, false)
                     .map(|(entry, handle, opts, _)| (entry, handle, opts))
             }
         )

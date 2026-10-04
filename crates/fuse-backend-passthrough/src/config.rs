@@ -181,6 +181,22 @@ pub struct Config {
     ///
     /// The default is `true`.
     pub allow_direct_io: bool,
+
+    /// Use kernel FUSE passthrough (`FsOptions::PASSTHROUGH`, Linux 6.9+) for regular files.
+    ///
+    /// When enabled and negotiated with the kernel, opening a regular file registers it as a
+    /// backing file through the registry set with `PassthroughFs::set_backing_registry()`, and
+    /// the kernel then serves read/write/splice/mmap of the open file directly from the backing
+    /// file, without sending FUSE_READ/FUSE_WRITE requests to the daemon. Registering backing
+    /// files requires `CAP_SYS_ADMIN`; passthrough is disabled for the rest of the session if
+    /// the kernel rejects the registration for lack of privileges or support.
+    ///
+    /// Passthrough IO bypasses the file system, so it can't be combined with `writeback` (the
+    /// kernel doesn't support both) or `seal_size`; both are reset when this is enabled. It's
+    /// only used for sync `FileSystem` opens, and requires open requests (`no_open == false`).
+    ///
+    /// The default is `false`.
+    pub fuse_passthrough: bool,
 }
 
 impl Default for Config {
@@ -205,6 +221,7 @@ impl Default for Config {
             dir_attr_timeout: None,
             use_host_ino: false,
             allow_direct_io: true,
+            fuse_passthrough: false,
         }
     }
 }

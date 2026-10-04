@@ -530,6 +530,7 @@ impl<S: BitmapSlice + Send + Sync> PassthroughFs<S> {
         inode: Inode,
         flags: u32,
         fuse_flags: u32,
+        passthrough: bool,
     ) -> io::Result<(Option<Handle>, OpenOptions, Option<u32>)> {
         let killpriv = if self.killpriv_v2.load(Ordering::Relaxed)
             && (fuse_flags & FOPEN_IN_KILL_SUIDGID != 0)
@@ -541,9 +542,20 @@ impl<S: BitmapSlice + Send + Sync> PassthroughFs<S> {
         let file = self.open_inode(inode, flags as i32)?;
         drop(killpriv);
 
-        let data = HandleData::new(inode, file, flags);
+        let mut data = HandleData::new(inode, file, flags);
+        let backing_id = if passthrough {
+            self.set_handle_backing(&mut data)
+        } else {
+            None
+        };
         let handle = self.next_handle.fetch_add(1, Ordering::Relaxed);
         self.handle_map.insert(handle, data);
+
+        if backing_id.is_some() {
+            // The kernel serves the IO of passthrough files from the backing file, so the
+            // caching options don't apply, and it rejects most of them with passthrough.
+            return Ok((Some(handle), OpenOptions::PASSTHROUGH, backing_id));
+        }
 
         let mut opts = OpenOptions::empty();
         // If the client requested O_DIRECT and we honor it, `open_inode()`
@@ -580,6 +592,108 @@ impl<S: BitmapSlice + Send + Sync> PassthroughFs<S> {
         };
 
         Ok((Some(handle), opts, None))
+    }
+
+    /// Set up kernel FUSE passthrough for a new handle if enabled, see
+    /// `Config::fuse_passthrough`, returning the backing file id to reply with.
+    fn set_handle_backing(&self, data: &mut HandleData) -> Option<u32> {
+        if !self.cfg.fuse_passthrough {
+            return None;
+        }
+        let inode_data = self.inode_map.get(data.inode).ok()?;
+        let id = self.get_backing(&inode_data, &data.file)?;
+        data.backing = Some(inode_data);
+        Some(id)
+    }
+
+    /// Open a file, using kernel FUSE passthrough if `passthrough` is true and it's enabled.
+    pub(crate) fn open_impl(
+        &self,
+        inode: Inode,
+        flags: u32,
+        fuse_flags: u32,
+        passthrough: bool,
+    ) -> io::Result<(Option<Handle>, OpenOptions, Option<u32>)> {
+        if self.no_open.load(Ordering::Relaxed) {
+            info!("fuse: open is not supported.");
+            Err(enosys())
+        } else {
+            self.do_open(inode, flags, fuse_flags, passthrough)
+        }
+    }
+
+    /// Create and open a file, using kernel FUSE passthrough if `passthrough` is true and
+    /// it's enabled.
+    pub(crate) fn create_impl(
+        &self,
+        ctx: &Context,
+        parent: Inode,
+        name: &CStr,
+        args: CreateIn,
+        passthrough: bool,
+    ) -> io::Result<(Entry, Option<Handle>, OpenOptions, Option<u32>)> {
+        self.validate_path_component(name)?;
+
+        let dir = self.inode_map.get(parent)?;
+        let dir_file = dir.get_file()?;
+
+        let new_file = {
+            let _groups = ScopedSuppGroups::new(ctx.supp_gid)?;
+            let (_uid, _gid) = set_creds(ctx.uid, ctx.gid)?;
+
+            let flags = self.get_writeback_open_flags(args.flags as i32);
+            Self::create_file_excl(&dir_file, name, flags, args.mode & !(args.umask & 0o777))?
+        };
+
+        let entry = self.do_lookup(parent, name)?;
+        let file = match new_file {
+            // File didn't exist, now created by create_file_excl()
+            Some(f) => f,
+            // File exists, and args.flags doesn't contain O_EXCL. Now let's open it with
+            // open_inode().
+            None => {
+                // Cap restored when _killpriv is dropped
+                let _killpriv = if self.killpriv_v2.load(Ordering::Relaxed)
+                    && (args.fuse_flags & FOPEN_IN_KILL_SUIDGID != 0)
+                {
+                    self::drop_cap_fsetid()?
+                } else {
+                    None
+                };
+
+                let (_uid, _gid) = set_creds(ctx.uid, ctx.gid)?;
+                self.open_inode(entry.inode, args.flags as i32)?
+            }
+        };
+
+        let mut backing_id = None;
+        let ret_handle = if !self.no_open.load(Ordering::Relaxed) {
+            let handle = self.next_handle.fetch_add(1, Ordering::Relaxed);
+            let mut data = HandleData::new(entry.inode, file, args.flags);
+            if passthrough {
+                backing_id = self.set_handle_backing(&mut data);
+            }
+
+            self.handle_map.insert(handle, data);
+            Some(handle)
+        } else {
+            None
+        };
+
+        if backing_id.is_some() {
+            // See do_open().
+            return Ok((entry, ret_handle, OpenOptions::PASSTHROUGH, backing_id));
+        }
+
+        let mut opts = OpenOptions::empty();
+        match self.cfg.cache_policy {
+            CachePolicy::Never => opts |= OpenOptions::DIRECT_IO,
+            CachePolicy::Metadata => opts |= OpenOptions::DIRECT_IO,
+            CachePolicy::Always => opts |= OpenOptions::KEEP_CACHE,
+            _ => {}
+        };
+
+        Ok((entry, ret_handle, opts, None))
     }
 
     fn do_getattr(
@@ -671,6 +785,18 @@ impl<S: BitmapSlice + Send + Sync> FileSystem for PassthroughFs<S> {
             opts |= FsOptions::WRITEBACK_CACHE;
             self.writeback.store(true, Ordering::Relaxed);
         }
+        // The kernel doesn't support passthrough together with the writeback cache.
+        if self.cfg.fuse_passthrough
+            && capable.contains(FsOptions::PASSTHROUGH)
+            && !opts.contains(FsOptions::WRITEBACK_CACHE)
+        {
+            if self.backing_registry.read().unwrap().is_none() {
+                warn!("passthroughfs: no backing file registry set, FUSE passthrough disabled");
+            } else {
+                opts |= FsOptions::PASSTHROUGH;
+                self.passthrough.store(true, Ordering::Relaxed);
+            }
+        }
         if (!self.cfg.do_import || self.cfg.no_open)
             && capable.contains(FsOptions::ZERO_MESSAGE_OPEN)
         {
@@ -761,7 +887,7 @@ impl<S: BitmapSlice + Send + Sync> FileSystem for PassthroughFs<S> {
             info!("fuse: opendir is not supported.");
             Err(enosys())
         } else {
-            self.do_open(inode, flags | (libc::O_DIRECTORY as u32), 0)
+            self.do_open(inode, flags | (libc::O_DIRECTORY as u32), 0, false)
                 .map(|(a, b, _)| (a, b))
         }
     }
@@ -889,12 +1015,7 @@ impl<S: BitmapSlice + Send + Sync> FileSystem for PassthroughFs<S> {
         flags: u32,
         fuse_flags: u32,
     ) -> io::Result<(Option<Handle>, OpenOptions, Option<u32>)> {
-        if self.no_open.load(Ordering::Relaxed) {
-            info!("fuse: open is not supported.");
-            Err(enosys())
-        } else {
-            self.do_open(inode, flags, fuse_flags)
-        }
+        self.open_impl(inode, flags, fuse_flags, true)
     }
 
     fn release(
@@ -921,59 +1042,7 @@ impl<S: BitmapSlice + Send + Sync> FileSystem for PassthroughFs<S> {
         name: &CStr,
         args: CreateIn,
     ) -> io::Result<(Entry, Option<Handle>, OpenOptions, Option<u32>)> {
-        self.validate_path_component(name)?;
-
-        let dir = self.inode_map.get(parent)?;
-        let dir_file = dir.get_file()?;
-
-        let new_file = {
-            let _groups = ScopedSuppGroups::new(ctx.supp_gid)?;
-            let (_uid, _gid) = set_creds(ctx.uid, ctx.gid)?;
-
-            let flags = self.get_writeback_open_flags(args.flags as i32);
-            Self::create_file_excl(&dir_file, name, flags, args.mode & !(args.umask & 0o777))?
-        };
-
-        let entry = self.do_lookup(parent, name)?;
-        let file = match new_file {
-            // File didn't exist, now created by create_file_excl()
-            Some(f) => f,
-            // File exists, and args.flags doesn't contain O_EXCL. Now let's open it with
-            // open_inode().
-            None => {
-                // Cap restored when _killpriv is dropped
-                let _killpriv = if self.killpriv_v2.load(Ordering::Relaxed)
-                    && (args.fuse_flags & FOPEN_IN_KILL_SUIDGID != 0)
-                {
-                    self::drop_cap_fsetid()?
-                } else {
-                    None
-                };
-
-                let (_uid, _gid) = set_creds(ctx.uid, ctx.gid)?;
-                self.open_inode(entry.inode, args.flags as i32)?
-            }
-        };
-
-        let ret_handle = if !self.no_open.load(Ordering::Relaxed) {
-            let handle = self.next_handle.fetch_add(1, Ordering::Relaxed);
-            let data = HandleData::new(entry.inode, file, args.flags);
-
-            self.handle_map.insert(handle, data);
-            Some(handle)
-        } else {
-            None
-        };
-
-        let mut opts = OpenOptions::empty();
-        match self.cfg.cache_policy {
-            CachePolicy::Never => opts |= OpenOptions::DIRECT_IO,
-            CachePolicy::Metadata => opts |= OpenOptions::DIRECT_IO,
-            CachePolicy::Always => opts |= OpenOptions::KEEP_CACHE,
-            _ => {}
-        };
-
-        Ok((entry, ret_handle, opts, None))
+        self.create_impl(ctx, parent, name, args, true)
     }
 
     fn unlink(&self, _ctx: &Context, parent: Inode, name: &CStr) -> io::Result<()> {
@@ -2374,6 +2443,117 @@ mod tests {
             .copy_file_range(&ctx, ino_in, 0xdead, 0, ino_out, fh_out, 0, 4096, 0)
             .unwrap_err();
         assert_eq!(err.raw_os_error(), Some(libc::EBADF));
+    }
+
+    #[derive(Default)]
+    struct FakeBackingRegistry {
+        next_id: std::sync::atomic::AtomicU32,
+        registered: Mutex<std::collections::HashSet<u32>>,
+        fail: Mutex<Option<i32>>,
+    }
+
+    impl BackingFileRegistry for FakeBackingRegistry {
+        fn open_backing(&self, fd: std::os::fd::BorrowedFd<'_>) -> io::Result<u32> {
+            if let Some(errno) = *self.fail.lock().unwrap() {
+                return Err(io::Error::from_raw_os_error(errno));
+            }
+            let st = stat_fd(&fd, None).unwrap();
+            assert_eq!(st.st_mode & libc::S_IFMT, libc::S_IFREG);
+            let id = self.next_id.fetch_add(1, Ordering::Relaxed) + 1;
+            self.registered.lock().unwrap().insert(id);
+            Ok(id)
+        }
+
+        fn close_backing(&self, backing_id: u32) -> io::Result<()> {
+            assert!(self.registered.lock().unwrap().remove(&backing_id));
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn test_fuse_passthrough() {
+        let source = TempDir::new().expect("Cannot create temporary directory.");
+        let cfg = Config {
+            root_dir: source.as_path().to_str().unwrap().to_string(),
+            // Reset, the kernel doesn't support writeback cache with passthrough.
+            writeback: true,
+            fuse_passthrough: true,
+            ..Default::default()
+        };
+        let ctx = prepare_context();
+
+        // Not used without a backing file registry.
+        let fs = PassthroughFs::<()>::new(cfg.clone()).unwrap();
+        let opts = fs.init(FsOptions::all()).unwrap();
+        assert!(!opts.contains(FsOptions::PASSTHROUGH));
+        assert!(!opts.contains(FsOptions::WRITEBACK_CACHE));
+
+        let fs = PassthroughFs::<()>::new(cfg).unwrap();
+        let registry = Arc::new(FakeBackingRegistry::default());
+        fs.set_backing_registry(registry.clone());
+        let opts = fs.init(FsOptions::all()).unwrap();
+        assert!(opts.contains(FsOptions::PASSTHROUGH));
+        assert!(!opts.contains(FsOptions::WRITEBACK_CACHE));
+
+        let create = |name: &str| {
+            let args = CreateIn {
+                flags: libc::O_RDWR as u32,
+                mode: 0o644,
+                umask: 0,
+                fuse_flags: 0,
+            };
+            let name = CString::new(name).unwrap();
+            let (entry, handle, opts, backing_id) = fs.create(&ctx, ROOT_ID, &name, args).unwrap();
+            (entry.inode, handle.unwrap(), opts, backing_id)
+        };
+        let open = |inode| {
+            let (handle, opts, backing_id) =
+                fs.open(&ctx, inode, libc::O_RDONLY as u32, 0).unwrap();
+            (handle.unwrap(), opts, backing_id)
+        };
+        let release = |inode, handle| {
+            fs.release(&ctx, inode, 0, handle, false, false, None)
+                .unwrap()
+        };
+        let registered = || registry.registered.lock().unwrap().len();
+
+        // All open files of an inode share the backing file, which is unregistered with the
+        // last one.
+        let (ino_a, h1, opts, id) = create("a");
+        assert_eq!(opts, OpenOptions::PASSTHROUGH);
+        assert_eq!(id, Some(1));
+        let (h2, opts, id) = open(ino_a);
+        assert_eq!(opts, OpenOptions::PASSTHROUGH);
+        assert_eq!(id, Some(1));
+        assert_eq!(registered(), 1);
+        release(ino_a, h1);
+        assert_eq!(registered(), 1);
+        release(ino_a, h2);
+        assert_eq!(registered(), 0);
+
+        // Directories don't use passthrough.
+        let (_, opts) = fs.opendir(&ctx, ROOT_ID, libc::O_RDONLY as u32).unwrap();
+        assert!(!opts.contains(OpenOptions::PASSTHROUGH));
+
+        // Failing to register for lack of privileges disables passthrough, except for inodes
+        // which already have open passthrough files.
+        let (h3, _, id) = open(ino_a);
+        assert_eq!(id, Some(2));
+        *registry.fail.lock().unwrap() = Some(libc::EPERM);
+        let (ino_b, h4, opts, id) = create("b");
+        assert!(!opts.contains(OpenOptions::PASSTHROUGH));
+        assert_eq!(id, None);
+        let (h5, opts, id) = open(ino_a);
+        assert_eq!(opts, OpenOptions::PASSTHROUGH);
+        assert_eq!(id, Some(2));
+        release(ino_a, h3);
+        release(ino_a, h5);
+        release(ino_b, h4);
+        assert_eq!(registered(), 0);
+        *registry.fail.lock().unwrap() = None;
+        let (_, opts, id) = open(ino_a);
+        assert!(!opts.contains(OpenOptions::PASSTHROUGH));
+        assert_eq!(id, None);
     }
 
     #[test]

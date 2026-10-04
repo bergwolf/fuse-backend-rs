@@ -23,6 +23,8 @@ So the fuse-rs crate is a library to communicate with the Linux FUSE clients, wh
 - Transport layer, which supports both the Linux Fuse device and virtio-fs protocol.
 - VFS/pseudo_fs, an abstraction layer to support multiple file systems by a single virtio-fs device.
 - A sample passthrough file system implementation, which passes through files from daemons to clients. 
+  On Linux 6.9+ it can hand opened files to the kernel's FUSE passthrough (`FUSE_PASSTHROUGH`), so
+  reads and writes bypass the daemon (`passthrough::Config::fuse_passthrough`, needs `CAP_SYS_ADMIN`).
 
 ![arch](docs/images/fuse-backend-architecture.svg)
 

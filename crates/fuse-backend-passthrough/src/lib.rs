@@ -42,7 +42,7 @@ use self::util::{
 };
 use fuse_backend_core::abi::fuse_abi as fuse;
 use fuse_backend_core::abi::fuse_abi::Opcode;
-use fuse_backend_core::api::filesystem::Entry;
+use fuse_backend_core::api::filesystem::{BackingFileRegistry, Entry};
 use fuse_backend_core::api::{
     validate_path_component, BackendFileSystem, CURRENT_DIR_CSTR, EMPTY_CSTR, PARENT_DIR_CSTR,
     PROC_SELF_FD_CSTR, SLASH_ASCII, VFS_MAX_INO,
@@ -151,6 +151,19 @@ pub struct InodeData {
     refcount: AtomicU64,
     // File type and mode
     mode: u32,
+    // Kernel FUSE passthrough backing file, see `Config::fuse_passthrough`.
+    backing: Mutex<BackingFile>,
+}
+
+/// Kernel FUSE passthrough backing file of an inode.
+///
+/// The kernel requires all concurrent passthrough opens of an inode to use the same backing
+/// file, so the backing file is registered by the first open and shared, refcounted by the open
+/// handles, until the last one is released.
+#[derive(Debug, Default)]
+struct BackingFile {
+    id: u32,
+    users: u32,
 }
 
 impl InodeData {
@@ -161,6 +174,7 @@ impl InodeData {
             id,
             refcount: AtomicU64::new(refcount),
             mode,
+            backing: Mutex::new(BackingFile::default()),
         }
     }
 
@@ -261,6 +275,8 @@ struct HandleData {
     inode: Inode,
     file: File,
     open_flags: RwLock<u32>,
+    // Inode whose passthrough backing file is used by this handle.
+    backing: Option<Arc<InodeData>>,
 }
 
 impl HandleData {
@@ -269,6 +285,7 @@ impl HandleData {
             inode,
             file,
             open_flags: RwLock::new(flags),
+            backing: None,
         }
     }
 
@@ -325,7 +342,7 @@ impl HandleMap {
         self.handles.write().unwrap().insert(handle, Arc::new(data));
     }
 
-    fn release(&self, handle: Handle, inode: Inode) -> io::Result<()> {
+    fn release(&self, handle: Handle, inode: Inode) -> io::Result<Arc<HandleData>> {
         // Do not expect poisoned lock here, so safe to unwrap().
         let mut handles = self.handles.write().unwrap();
 
@@ -333,8 +350,7 @@ impl HandleMap {
             if e.get().inode == inode {
                 // We don't need to close the file here because that will happen automatically when
                 // the last `Arc` is dropped.
-                e.remove();
-                return Ok(());
+                return Ok(e.remove());
             }
         }
 
@@ -426,6 +442,10 @@ pub struct PassthroughFs<S: BitmapSlice + Send + Sync = ()> {
     // `upgrade()` always fails for those.
     #[cfg(feature = "async-io")]
     shared_ref: std::sync::Weak<PassthroughFs<S>>,
+    // Whether kernel FUSE passthrough is negotiated and usable, see `Config::fuse_passthrough`.
+    passthrough: AtomicBool,
+    // Registry of passthrough backing files, see `set_backing_registry()`.
+    backing_registry: RwLock<Option<Arc<dyn BackingFileRegistry>>>,
 
     dir_entry_timeout: Duration,
     dir_attr_timeout: Duration,
@@ -447,6 +467,14 @@ impl<S: BitmapSlice + Send + Sync> PassthroughFs<S> {
                 "passthroughfs: writeback cache conflicts with cache=none, reset to no_writeback"
             );
             cfg.writeback = false;
+        }
+        if cfg.fuse_passthrough && cfg.writeback {
+            warn!("passthroughfs: writeback cache conflicts with FUSE passthrough, reset to no_writeback");
+            cfg.writeback = false;
+        }
+        if cfg.fuse_passthrough && cfg.seal_size {
+            warn!("passthroughfs: FUSE passthrough bypasses seal_size, disable FUSE passthrough");
+            cfg.fuse_passthrough = false;
         }
 
         // Safe because this is a constant value and a valid C string.
@@ -490,6 +518,8 @@ impl<S: BitmapSlice + Send + Sync> PassthroughFs<S> {
             async_thread_pool_enabled: AtomicBool::new(false),
             #[cfg(feature = "async-io")]
             shared_ref: std::sync::Weak::new(),
+            passthrough: AtomicBool::new(false),
+            backing_registry: RwLock::new(None),
             dir_entry_timeout,
             dir_attr_timeout,
             cfg,
@@ -529,6 +559,77 @@ impl<S: BitmapSlice + Send + Sync> PassthroughFs<S> {
         )));
 
         Ok(())
+    }
+
+    /// Set the registry used to register kernel FUSE passthrough backing files, see
+    /// `Config::fuse_passthrough`.
+    ///
+    /// For fusedev, use the registry of the session (`FuseSession::backing_registry()`), which
+    /// may be set up before the session is mounted.
+    pub fn set_backing_registry(&self, registry: Arc<dyn BackingFileRegistry>) {
+        *self.backing_registry.write().unwrap() = Some(registry);
+    }
+
+    /// Get the passthrough backing file id of an inode for a new open file, registering `file`
+    /// as the backing file if the inode has no open passthrough file yet.
+    ///
+    /// Returns `None` if the open shouldn't use passthrough.
+    fn get_backing(&self, data: &InodeData, file: &File) -> Option<u32> {
+        if !self.cfg.fuse_passthrough || data.mode & libc::S_IFMT != libc::S_IFREG {
+            return None;
+        }
+
+        // Do not expect poisoned lock here, so safe to unwrap().
+        let mut backing = data.backing.lock().unwrap();
+        // Once an inode has an open passthrough file, the kernel requires all its other open
+        // files to use the same backing file.
+        if backing.users == 0 {
+            if !self.passthrough.load(Ordering::Relaxed) {
+                return None;
+            }
+            let registry = self.backing_registry.read().unwrap().clone()?;
+            match registry.open_backing(file.as_fd()) {
+                Ok(id) => backing.id = id,
+                Err(e) => {
+                    match e.raw_os_error() {
+                        // No CAP_SYS_ADMIN, or no kernel support.
+                        Some(libc::EPERM)
+                        | Some(libc::ENOTTY)
+                        | Some(libc::EOPNOTSUPP)
+                        | Some(libc::ENOTCONN) => {
+                            warn!("passthroughfs: disable FUSE passthrough, failed to register backing file: {}", e);
+                            self.passthrough.store(false, Ordering::Relaxed);
+                        }
+                        _ => warn!(
+                            "passthroughfs: failed to register backing file of inode {}: {}",
+                            data.inode, e
+                        ),
+                    }
+                    return None;
+                }
+            }
+        }
+        backing.users += 1;
+        Some(backing.id)
+    }
+
+    /// Release the reference to the passthrough backing file of an inode taken by
+    /// `get_backing()`, unregistering it when it's the last one.
+    fn put_backing(&self, data: &InodeData) {
+        // Do not expect poisoned lock here, so safe to unwrap().
+        let mut backing = data.backing.lock().unwrap();
+        backing.users -= 1;
+        if backing.users == 0 {
+            let id = std::mem::take(&mut backing.id);
+            if let Some(registry) = self.backing_registry.read().unwrap().as_ref() {
+                if let Err(e) = registry.close_backing(id) {
+                    warn!(
+                        "passthroughfs: failed to unregister backing file {} of inode {}: {}",
+                        id, data.inode, e
+                    );
+                }
+            }
+        }
     }
 
     /// Get the list of file descriptors which should be reserved across live upgrade.
@@ -827,8 +928,11 @@ impl<S: BitmapSlice + Send + Sync> PassthroughFs<S> {
         // `HandleMap::clear()`.  If `release()` fails the cached cookie (if
         // any) is left behind; that is harmless and it will be dropped by
         // `destroy()`.
-        self.handle_map.release(handle, inode)?;
+        let data = self.handle_map.release(handle, inode)?;
         self.handle_map.remove_cookie(handle);
+        if let Some(inode_data) = data.backing.as_ref() {
+            self.put_backing(inode_data);
+        }
         Ok(())
     }
 
