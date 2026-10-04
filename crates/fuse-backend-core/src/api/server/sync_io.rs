@@ -983,6 +983,13 @@ impl<F: FileSystem + Sync> Server<F> {
                     // 1MB by default, see set_max_write().
                     out.max_write = max_req_pages as u32 * pagesize() as u32;
                 }
+                #[cfg(target_os = "linux")]
+                if enabled.contains(FsOptions::PASSTHROUGH) {
+                    if enabled.contains(FsOptions::WRITEBACK_CACHE) {
+                        warn!("fuse: the kernel disables FUSE passthrough with writeback cache");
+                    }
+                    out.max_stack_depth = self.max_stack_depth.load(Ordering::Relaxed);
+                }
                 self.vers.store(
                     encode_version(version.major, version.minor),
                     Ordering::Release,
@@ -2103,6 +2110,67 @@ mod tests {
         server.set_max_write(0);
         let out = init(&server);
         assert_eq!(out.max_pages, super::super::MAX_REQ_PAGES);
+    }
+
+    #[test]
+    fn test_server_init_passthrough() {
+        struct PassthroughCapFs;
+        impl FileSystem for PassthroughCapFs {
+            type Inode = u64;
+            type Handle = u64;
+
+            fn init(&self, capable: FsOptions) -> io::Result<FsOptions> {
+                Ok(capable & FsOptions::PASSTHROUGH)
+            }
+        }
+
+        let init = |server: &Server<PassthroughCapFs>, flags2: u32| {
+            let mut read_buf = [0u8; size_of::<InitIn>() + size_of::<InitIn2>()];
+            let init_in = InitIn {
+                major: KERNEL_VERSION,
+                minor: KERNEL_MINOR_VERSION,
+                max_readahead: 0,
+                flags: FsOptions::INIT_EXT.bits() as u32,
+            };
+            read_buf[..size_of::<InitIn>()].copy_from_slice(init_in.as_slice());
+            let init_in2 = InitIn2 {
+                flags2,
+                unused: [0; 11],
+            };
+            read_buf[size_of::<InitIn>()..].copy_from_slice(init_in2.as_slice());
+            let mut write_buf = [0u8; 4096];
+            let ctx = {
+                let reader = Reader::<()>::from_slice(&mut read_buf);
+                let writer = TestWriter::new(&mut write_buf);
+                SrvContext::new(InHeader::default(), reader, writer)
+            };
+            let res = server.init(ctx, |_| {}).unwrap();
+            assert_eq!(res, size_of::<OutHeader>() + size_of::<InitOut>());
+            let mut out = InitOut::default();
+            out.as_mut_slice()
+                .copy_from_slice(&write_buf[size_of::<OutHeader>()..res]);
+            out
+        };
+        let passthrough = (FsOptions::PASSTHROUGH.bits() >> 32) as u32;
+
+        // The kernel only enables passthrough with a max_stack_depth in 1..=2.
+        let server = Server::new(PassthroughCapFs);
+        let out = init(&server, passthrough);
+        assert_ne!(out.flags2 & passthrough, 0);
+        assert_ne!(out.flags & FsOptions::INIT_EXT.bits() as u32, 0);
+        assert_eq!(out.max_stack_depth, super::super::DEFAULT_MAX_STACK_DEPTH);
+
+        server.set_max_stack_depth(2);
+        assert_eq!(init(&server, passthrough).max_stack_depth, 2);
+        server.set_max_stack_depth(0);
+        assert_eq!(init(&server, passthrough).max_stack_depth, 1);
+        server.set_max_stack_depth(3);
+        assert_eq!(init(&server, passthrough).max_stack_depth, 2);
+
+        // Not negotiated.
+        let out = init(&server, 0);
+        assert_eq!(out.flags2 & passthrough, 0);
+        assert_eq!(out.max_stack_depth, 0);
     }
 
     #[test]

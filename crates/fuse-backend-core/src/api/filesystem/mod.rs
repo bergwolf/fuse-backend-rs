@@ -154,6 +154,25 @@ impl<FS: BackendFileSystem> BackendFileSystem for Arc<FS> {
     }
 }
 
+/// Registers backing files with the kernel for FUSE passthrough (`FsOptions::PASSTHROUGH`).
+///
+/// File systems that support passthrough register the file backing an inode when it's opened,
+/// reply to the open/create request with `OpenOptions::PASSTHROUGH` and the returned id, and
+/// unregister the id once no open file uses it anymore. Transports that support passthrough
+/// implement this trait, e.g. `FuseBackingRegistry` of the fusedev transport.
+#[cfg(target_os = "linux")]
+pub trait BackingFileRegistry: Send + Sync {
+    /// Register `fd`, an open regular file, as a passthrough backing file and return its id.
+    ///
+    /// Fails with `EPERM` without `CAP_SYS_ADMIN` or if passthrough wasn't negotiated.
+    fn open_backing(&self, fd: std::os::fd::BorrowedFd<'_>) -> io::Result<u32>;
+
+    /// Unregister a backing file id returned by `open_backing()`.
+    ///
+    /// Open files already using the backing file keep using it until they're closed.
+    fn close_backing(&self, backing_id: u32) -> io::Result<()>;
+}
+
 /// Information about a path in the filesystem.
 #[derive(Copy, Clone, Debug)]
 pub struct Entry {

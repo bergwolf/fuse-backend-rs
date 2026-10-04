@@ -52,6 +52,13 @@ const DIRENT_PADDING: [u8; 8] = [0; 8];
 /// Maximum number of pages required for FUSE requests.
 pub const MAX_REQ_PAGES: u16 = 256; // 1MB
 
+/// Default passthrough backing file stacking depth, see `Server::set_max_stack_depth()`.
+#[cfg(target_os = "linux")]
+pub const DEFAULT_MAX_STACK_DEPTH: u32 = 1;
+// FILESYSTEM_MAX_STACK_DEPTH of the kernel.
+#[cfg(target_os = "linux")]
+const MAX_STACK_DEPTH: u32 = 2;
+
 /// Fuse Server to handle requests from the Fuse client and vhost user master.
 pub struct Server<F: FileSystem + Sync> {
     fs: F,
@@ -60,6 +67,9 @@ pub struct Server<F: FileSystem + Sync> {
     options: AtomicU64,
     // FUSE_WRITE payload limit requested through `set_max_write()`, 0 for the default.
     max_write: AtomicU32,
+    // Passthrough backing file stacking depth, see `set_max_stack_depth()`.
+    #[cfg(target_os = "linux")]
+    max_stack_depth: AtomicU32,
     /// Extra capability flags to advertise in the INIT reply, requested
     /// through `set_uring()` (experimental fusedev-uring transport).
     #[cfg(all(target_os = "linux", feature = "fusedev-uring"))]
@@ -77,6 +87,8 @@ impl<F: FileSystem + Sync> Server<F> {
             vers: AtomicU64::new(encode_version(KERNEL_VERSION, KERNEL_MINOR_VERSION)),
             options: AtomicU64::new(0),
             max_write: AtomicU32::new(0),
+            #[cfg(target_os = "linux")]
+            max_stack_depth: AtomicU32::new(DEFAULT_MAX_STACK_DEPTH),
             #[cfg(all(target_os = "linux", feature = "fusedev-uring"))]
             extra_init_flags: AtomicU64::new(0),
             #[cfg(all(target_os = "linux", feature = "fusedev-uring"))]
@@ -107,6 +119,22 @@ impl<F: FileSystem + Sync> Server<F> {
         };
         self.max_write
             .store(max_write, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// Set the maximum filesystem stacking depth of FUSE passthrough backing files, advertised
+    /// in the INIT reply when `FsOptions::PASSTHROUGH` is negotiated.
+    ///
+    /// With the default of 1, backing files must live on a non-stacked filesystem (ext4, xfs,
+    /// tmpfs, ...) and the FUSE mount itself may be used as a layer of a stacked filesystem such
+    /// as overlayfs; 2 allows backing files on a stacked filesystem, but then the FUSE mount
+    /// can't be stacked. The kernel only enables passthrough for values in `1..=2`, so other
+    /// values are clamped to that range. Must be called before the INIT exchange to take effect.
+    #[cfg(target_os = "linux")]
+    pub fn set_max_stack_depth(&self, depth: u32) {
+        self.max_stack_depth.store(
+            depth.clamp(1, MAX_STACK_DEPTH),
+            std::sync::atomic::Ordering::Relaxed,
+        );
     }
 
     /// Number of pages per request advertised in the INIT reply, see `set_max_write()`.
