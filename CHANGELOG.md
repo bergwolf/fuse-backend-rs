@@ -13,6 +13,11 @@
   between the facade and `fuse-backend-core` and carries the `arc-swap` and
   `persist` (`versionize`/`dbs-snapshot`) stack that the multiplexer needs.
 - [188](https://github.com/cloud-hypervisor/fuse-backend-rs/issues/188): docs: document the experimental status of async-io support.
+- [3](https://github.com/bergwolf/fuse-backend-rs/pull/3): Forward `FUSE_COPY_FILE_RANGE` through the new
+  `FileSystem::copy_file_range()` (default `ENOSYS`); `Vfs` routes it to the
+  backing file system (`EXDEV` across mounts) and `PassthroughFs` implements
+  it with `copy_file_range(2)`, so `cp` inside a mount no longer copies the
+  data through the daemon.
 
 ### Changed
 - [254](https://github.com/cloud-hypervisor/fuse-backend-rs/pull/254): `fuse-backend-rs` is now a thin facade re-exporting the sub-crates. Every

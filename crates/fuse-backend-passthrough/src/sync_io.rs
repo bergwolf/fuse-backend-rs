@@ -1749,6 +1749,52 @@ impl<S: BitmapSlice + Send + Sync> FileSystem for PassthroughFs<S> {
             Ok(res as u64)
         }
     }
+
+    #[allow(clippy::too_many_arguments)]
+    fn copy_file_range(
+        &self,
+        _ctx: &Context,
+        inode_in: Inode,
+        handle_in: Handle,
+        offset_in: u64,
+        inode_out: Inode,
+        handle_out: Handle,
+        offset_out: u64,
+        len: u64,
+        flags: u64,
+    ) -> io::Result<usize> {
+        // Let the Arc<HandleData> in scope, otherwise the fds may get invalid.
+        let data_in = self.get_data(handle_in, inode_in, libc::O_RDONLY)?;
+        let data_out = self.get_data(handle_out, inode_out, libc::O_RDWR)?;
+        let fd_in = data_in.borrow_fd();
+        let fd_out = data_out.borrow_fd();
+        let flags: libc::c_uint = std::convert::TryFrom::try_from(flags).map_err(|_| einval())?;
+
+        if self.seal_size.load(Ordering::Relaxed) {
+            let st = stat_fd(&fd_out, None)?;
+            self.seal_size_check(Opcode::Write, st.st_size as u64, offset_out, len, 0)?;
+        }
+
+        let mut off_in = offset_in as libc::off64_t;
+        let mut off_out = offset_out as libc::off64_t;
+        // Safe because this doesn't modify any memory we don't own and we check the return
+        // value.
+        let res = unsafe {
+            libc::copy_file_range(
+                fd_in.as_raw_fd(),
+                &mut off_in,
+                fd_out.as_raw_fd(),
+                &mut off_out,
+                len as libc::size_t,
+                flags,
+            )
+        };
+        if res < 0 {
+            Err(io::Error::last_os_error())
+        } else {
+            Ok(res as usize)
+        }
+    }
 }
 
 #[cfg(test)]
@@ -2283,6 +2329,51 @@ mod tests {
         assert_eq!(att.st_size, 8192);
         // suid/sgid not dropped
         assert_eq!(att.st_mode, 0o106777);
+    }
+
+    #[test]
+    fn test_copy_file_range() {
+        let (fs, source) = prepare_fs_tmpdir();
+        let ctx = prepare_context();
+
+        let create = |name: &str| {
+            let fname = CString::new(name).unwrap();
+            let args = CreateIn {
+                flags: libc::O_RDWR as u32,
+                mode: 0o644,
+                umask: 0,
+                fuse_flags: 0,
+            };
+            let (entry, handle, _, _) = fs.create(&ctx, ROOT_ID, &fname, args).unwrap();
+            (entry.inode, handle.unwrap())
+        };
+        let (ino_in, fh_in) = create("copy_src");
+        let (ino_out, fh_out) = create("copy_dst");
+
+        let payload: Vec<u8> = (0..3 * 4096).map(|i| (i % 251) as u8).collect();
+        std::fs::write(source.as_path().join("copy_src"), &payload).unwrap();
+
+        // Copy the second half of the source to offset 100 of the destination.
+        let copied = fs
+            .copy_file_range(&ctx, ino_in, fh_in, 4096, ino_out, fh_out, 100, 8192, 0)
+            .unwrap();
+        assert_eq!(copied, 8192);
+        let out = std::fs::read(source.as_path().join("copy_dst")).unwrap();
+        assert_eq!(out.len(), 100 + 8192);
+        assert!(out[..100].iter().all(|&b| b == 0));
+        assert_eq!(&out[100..], &payload[4096..]);
+
+        // Copying from EOF copies nothing.
+        let copied = fs
+            .copy_file_range(&ctx, ino_in, fh_in, 3 * 4096, ino_out, fh_out, 0, 4096, 0)
+            .unwrap();
+        assert_eq!(copied, 0);
+
+        // Unknown handles are rejected.
+        let err = fs
+            .copy_file_range(&ctx, ino_in, 0xdead, 0, ino_out, fh_out, 0, 4096, 0)
+            .unwrap_err();
+        assert_eq!(err.raw_os_error(), Some(libc::EBADF));
     }
 
     #[test]
