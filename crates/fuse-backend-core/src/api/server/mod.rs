@@ -286,6 +286,50 @@ fn decode_version(v: u64) -> ServerVersion {
     }
 }
 
+/// Bodies up to this size are kept on the stack by [`MessageBody`]. It holds a
+/// NUL-terminated `NAME_MAX` name, or two of them for RENAME.
+const MESSAGE_BODY_INLINE_SIZE: usize = 512;
+
+/// A request body copied out of the transport buffer.
+///
+/// Small bodies (file names) are stored inline so name-carrying requests such
+/// as LOOKUP don't allocate; larger ones fall back to the heap. The body is
+/// always copied, so a peer sharing the buffer (e.g. a virtio-fs guest) can't
+/// change it after it has been validated.
+// The inline variant is large on purpose: it only lives on the stack and
+// boxing it would bring back the heap allocation this type avoids.
+#[allow(clippy::large_enum_variant)]
+enum MessageBody {
+    Inline {
+        buf: [u8; MESSAGE_BODY_INLINE_SIZE],
+        len: usize,
+    },
+    Heap(Vec<u8>),
+}
+
+impl std::ops::Deref for MessageBody {
+    type Target = [u8];
+
+    fn deref(&self) -> &[u8] {
+        match self {
+            MessageBody::Inline { buf, len } => &buf[..*len],
+            MessageBody::Heap(buf) => buf,
+        }
+    }
+}
+
+impl AsRef<[u8]> for MessageBody {
+    fn as_ref(&self) -> &[u8] {
+        self
+    }
+}
+
+impl std::fmt::Debug for MessageBody {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        std::fmt::Debug::fmt(&**self, f)
+    }
+}
+
 struct ServerUtil();
 
 impl ServerUtil {
@@ -293,11 +337,18 @@ impl ServerUtil {
         r: &mut Reader<'_, S>,
         in_header: &InHeader,
         sub_hdr_sz: usize,
-    ) -> Result<Vec<u8>> {
+    ) -> Result<MessageBody> {
         let len = (in_header.len as usize)
             .checked_sub(size_of::<InHeader>())
             .and_then(|l| l.checked_sub(sub_hdr_sz))
             .ok_or(Error::InvalidHeaderLength)?;
+
+        if len <= MESSAGE_BODY_INLINE_SIZE {
+            let mut buf = [0u8; MESSAGE_BODY_INLINE_SIZE];
+            r.read_exact(&mut buf[..len])
+                .map_err(Error::DecodeMessage)?;
+            return Ok(MessageBody::Inline { buf, len });
+        }
 
         // Allocate buffer without zeroing out the content for performance.
         let mut buf = Vec::<u8>::with_capacity(len);
@@ -308,7 +359,7 @@ impl ServerUtil {
         };
         r.read_exact(&mut buf).map_err(Error::DecodeMessage)?;
 
-        Ok(buf)
+        Ok(MessageBody::Heap(buf))
     }
 
     fn extract_two_cstrs(buf: &[u8]) -> Result<(&CStr, &CStr)> {
@@ -466,5 +517,52 @@ mod tests {
         };
         // shoutld fail because of invalid sub header size
         assert!(ServerUtil::get_message_body(&mut r, &in_header, 0x1001).is_err());
+    }
+
+    #[test]
+    fn test_get_message_body_inline() {
+        let hdr = size_of::<InHeader>();
+        let mut read_buf = [0u8; 4096];
+        read_buf[..8].copy_from_slice(b"name\0foo");
+
+        let mut r = Reader::<()>::from_slice(&mut read_buf);
+        let in_header = InHeader {
+            len: (hdr + 5) as u32,
+            ..Default::default()
+        };
+        let buf = ServerUtil::get_message_body(&mut r, &in_header, 0).unwrap();
+        assert!(matches!(buf, MessageBody::Inline { .. }));
+        assert_eq!(&*buf, b"name\0");
+        assert_eq!(r.bytes_read(), 5);
+
+        // Largest inline body.
+        let mut r = Reader::<()>::from_slice(&mut read_buf);
+        let in_header = InHeader {
+            len: (hdr + MESSAGE_BODY_INLINE_SIZE) as u32,
+            ..Default::default()
+        };
+        let buf = ServerUtil::get_message_body(&mut r, &in_header, 0).unwrap();
+        assert!(matches!(buf, MessageBody::Inline { .. }));
+        assert_eq!(buf.len(), MESSAGE_BODY_INLINE_SIZE);
+        assert_eq!(&buf[..5], b"name\0");
+
+        // One more byte goes to the heap.
+        let mut r = Reader::<()>::from_slice(&mut read_buf);
+        let in_header = InHeader {
+            len: (hdr + MESSAGE_BODY_INLINE_SIZE + 1) as u32,
+            ..Default::default()
+        };
+        let buf = ServerUtil::get_message_body(&mut r, &in_header, 0).unwrap();
+        assert!(matches!(buf, MessageBody::Heap(_)));
+        assert_eq!(buf.len(), MESSAGE_BODY_INLINE_SIZE + 1);
+
+        // Short reader fails on the inline path too.
+        let mut short = [0u8; 4];
+        let mut r = Reader::<()>::from_slice(&mut short);
+        let in_header = InHeader {
+            len: (hdr + 5) as u32,
+            ..Default::default()
+        };
+        assert!(ServerUtil::get_message_body(&mut r, &in_header, 0).is_err());
     }
 }

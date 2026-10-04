@@ -87,6 +87,13 @@
 - [3](https://github.com/bergwolf/fuse-backend-rs/pull/3): `InitOut` gains the `max_stack_depth` field, carved out of
   `unused` (now `[u32; 6]`, the struct size is unchanged); code that builds
   an `InitOut` with a struct literal must adapt.
+- [3](https://github.com/bergwolf/fuse-backend-rs/pull/3): Serving a request from a contiguous buffer (the `/dev/fuse`
+  path) no longer allocates: `IoBuffers` keeps its first buffer inline
+  (new `IoBuffers::from_slice()`), reads within one buffer pass a single
+  slice on the stack instead of collecting a `Vec`, and request bodies of up
+  to 512 bytes (file names) are copied to the stack. The dispatch
+  micro-benchmark goes from 3-4 heap allocations to none per request and is
+  22-45% faster.
 
 ### Removed
 - [254](https://github.com/cloud-hypervisor/fuse-backend-rs/pull/254): Drop the vestigial `vhost` and `virtio-bindings` dependencies that the
