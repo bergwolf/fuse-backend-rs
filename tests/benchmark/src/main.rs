@@ -6,7 +6,8 @@
 //! A minimal fusedev passthrough daemon used to benchmark the synchronous
 //! and asynchronous IO paths with external tools such as fio.
 //!
-//! Usage: `fuse-backend-rs-benchmark <src> <mountpoint> [--async|--uring] [--threads N]`
+//! Usage: `fuse-backend-rs-benchmark <src> <mountpoint> [--async|--uring] [--threads N]
+//! [--max-write BYTES]`
 //!
 //! - default (sync) mode: requests are served by `N` worker threads, each
 //!   reading from its own fuse channel (the classic multi-threaded design).
@@ -17,6 +18,10 @@
 //! - `--uring` mode: requests are served through the FUSE-over-io_uring
 //!   transport (`UringFuseServing`, experimental, requires kernel 6.14+);
 //!   `N` limits the number of io_uring worker threads.
+//!
+//! `--max-write BYTES` raises the INIT `max_write`/`max_pages` and the
+//! session buffers accordingly (default 1MB); the kernel caps the request
+//! size to `/proc/sys/fs/fuse/max_pages_limit` pages.
 
 #[cfg(target_os = "linux")]
 mod daemon {
@@ -45,11 +50,12 @@ mod daemon {
         as_async: bool,
         as_uring: bool,
         thread_cnt: u32,
+        max_write: u32,
     }
 
     fn help() {
         println!(
-            "Usage:\n   fuse-backend-rs-benchmark <src> <mountpoint> [--async|--uring] [--threads N]\n"
+            "Usage:\n   fuse-backend-rs-benchmark <src> <mountpoint> [--async|--uring] [--threads N] [--max-write BYTES]\n"
         );
     }
 
@@ -65,6 +71,7 @@ mod daemon {
             as_async: false,
             as_uring: false,
             thread_cnt: 4,
+            max_write: 0,
         };
         let mut idx = 3;
         while idx < args.len() {
@@ -78,6 +85,17 @@ mod daemon {
                         return Err(Error::from_raw_os_error(libc::EINVAL));
                     }
                     res.thread_cnt = args[idx].parse().map_err(|_| {
+                        help();
+                        Error::from_raw_os_error(libc::EINVAL)
+                    })?;
+                }
+                "--max-write" => {
+                    idx += 1;
+                    if idx >= args.len() {
+                        help();
+                        return Err(Error::from_raw_os_error(libc::EINVAL));
+                    }
+                    res.max_write = args[idx].parse().map_err(|_| {
                         help();
                         Error::from_raw_os_error(libc::EINVAL)
                     })?;
@@ -265,6 +283,17 @@ mod daemon {
 
         let server = create_server(&args.src);
         let mut se = FuseSession::new(Path::new(&args.dest), "bench_passthru", "", false).unwrap();
+        if args.max_write != 0 {
+            // The session buffers must hold the largest request: max_write
+            // plus the header area.
+            server.set_max_write(args.max_write);
+            se.set_bufsize(args.max_write as usize + 0x1000);
+            info!(
+                "max_write {} session buffer {}",
+                args.max_write,
+                se.bufsize()
+            );
+        }
         se.mount().unwrap();
 
         if args.as_uring {

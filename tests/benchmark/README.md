@@ -34,13 +34,25 @@ io_uring is available) and uring mode (the experimental
 FUSE-over-io_uring transport, requires kernel 6.14+ and is skipped
 otherwise) — and runs identical fio workloads:
 
-- sequential read/write with 1MB requests
+- sequential read/write with 1MB requests (`BS`)
 - random read/write with 4KB requests
 - metadata operations (file create/delete)
 
 ```sh
 sudo tests/scripts/bench_sync_async.sh      # needs fio + fuse mount rights
 THREADS=8 RUNTIME=60 sudo -E tests/scripts/bench_sync_async.sh
+```
+
+By default the daemon negotiates the kernel's 1MB maximum request size
+(`FUSE_MAX_PAGES` with 256 pages). `MAX_WRITE=<bytes>` passes
+`--max-write <bytes>` to the daemon, which raises the negotiated
+`max_write`/`max_pages` (`Server::set_max_write()`) and sizes the fuse
+device buffers accordingly (`FuseSession::set_bufsize()`); the script also
+raises `/proc/sys/fs/fuse/max_pages_limit`, which caps the request size on
+the kernel side. Combine it with a larger `BS` to measure large requests:
+
+```sh
+BS=16M MAX_WRITE=16777216 sudo -E tests/scripts/bench_sync_async.sh
 ```
 
 The script builds the daemon in release mode; when invoking it with `sudo`,

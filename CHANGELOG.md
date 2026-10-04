@@ -18,6 +18,11 @@
   backing file system (`EXDEV` across mounts) and `PassthroughFs` implements
   it with `copy_file_range(2)`, so `cp` inside a mount no longer copies the
   data through the daemon.
+- [3](https://github.com/bergwolf/fuse-backend-rs/pull/3): `Server::set_max_write()` raises the negotiated
+  `max_write`/`max_pages` beyond the 1MB default, and
+  `FuseSession::set_bufsize()` sizes the fuse device buffers to match. The
+  benchmark daemon exposes them as `--max-write`, and
+  `tests/scripts/bench_sync_async.sh` gains the `BS` and `MAX_WRITE` tunables.
 
 ### Changed
 - [254](https://github.com/cloud-hypervisor/fuse-backend-rs/pull/254): `fuse-backend-rs` is now a thin facade re-exporting the sub-crates. Every
