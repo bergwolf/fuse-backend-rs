@@ -20,7 +20,7 @@ use std::ffi::CStr;
 use std::io::{self, Read};
 use std::marker::PhantomData;
 use std::mem::size_of;
-use std::sync::atomic::AtomicU64;
+use std::sync::atomic::{AtomicU32, AtomicU64};
 
 use crate::abi::fuse_abi::*;
 use crate::api::filesystem::{Context, FileSystem, ZeroCopyReader, ZeroCopyWriter};
@@ -58,6 +58,8 @@ pub struct Server<F: FileSystem + Sync> {
     vers: AtomicU64,
     // Options negotiated with the kernel through INIT, see `init()`.
     options: AtomicU64,
+    // FUSE_WRITE payload limit requested through `set_max_write()`, 0 for the default.
+    max_write: AtomicU32,
     /// Extra capability flags to advertise in the INIT reply, requested
     /// through `set_uring()` (experimental fusedev-uring transport).
     #[cfg(all(target_os = "linux", feature = "fusedev-uring"))]
@@ -74,11 +76,54 @@ impl<F: FileSystem + Sync> Server<F> {
             fs,
             vers: AtomicU64::new(encode_version(KERNEL_VERSION, KERNEL_MINOR_VERSION)),
             options: AtomicU64::new(0),
+            max_write: AtomicU32::new(0),
             #[cfg(all(target_os = "linux", feature = "fusedev-uring"))]
             extra_init_flags: AtomicU64::new(0),
             #[cfg(all(target_os = "linux", feature = "fusedev-uring"))]
             negotiated_init_flags: AtomicU64::new(0),
         }
+    }
+
+    /// Set the maximum payload of FUSE_WRITE requests to advertise in the INIT reply.
+    ///
+    /// The value is rounded up to a multiple of the page size and capped at `u16::MAX` pages,
+    /// and it is advertised through `max_write` and, when the kernel supports `FUSE_MAX_PAGES`,
+    /// `max_pages`. Passing 0 restores the default of `MAX_REQ_PAGES` pages (1MB with 4K
+    /// pages). Must be called before the INIT exchange to take effect.
+    ///
+    /// Requests up to the configured size (plus headers) are accepted from then on, so the
+    /// transport must be able to receive them: for fusedev, the session buffer (see
+    /// `FuseSession::set_bufsize()`) must be at least `max_write` plus the 4K header area, or
+    /// the kernel rejects reads from the fuse device with `EINVAL`. Note that the kernel caps
+    /// `max_pages` to `/proc/sys/fs/fuse/max_pages_limit` (256 pages by default), so larger
+    /// writes also need that limit raised.
+    pub fn set_max_write(&self, max_write: u32) {
+        let pagesize = crate::buffer::pagesize() as u64;
+        let max_write = if max_write == 0 {
+            0
+        } else {
+            let pages = std::cmp::min((max_write as u64).div_ceil(pagesize), u16::MAX as u64);
+            (pages * pagesize) as u32
+        };
+        self.max_write
+            .store(max_write, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// Number of pages per request advertised in the INIT reply, see `set_max_write()`.
+    fn max_req_pages(&self) -> u16 {
+        match self.max_write.load(std::sync::atomic::Ordering::Relaxed) {
+            0 => MAX_REQ_PAGES,
+            v => (v as usize / crate::buffer::pagesize()) as u16,
+        }
+    }
+
+    /// Largest request payload accepted from the transport: `MAX_BUFFER_SIZE`, or the size
+    /// configured through `set_max_write()` if that is larger.
+    fn max_buffer_size(&self) -> u32 {
+        std::cmp::max(
+            MAX_BUFFER_SIZE,
+            self.max_write.load(std::sync::atomic::Ordering::Relaxed),
+        )
     }
 
     /// Request serving FUSE requests over io_uring (experimental).
