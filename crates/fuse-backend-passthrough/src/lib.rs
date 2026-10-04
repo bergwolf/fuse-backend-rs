@@ -1786,6 +1786,7 @@ mod tests {
             gid: uid,
             pid: 1,
             supp_gid: Some(100000 + gid),
+            ..Default::default()
         };
         let parent = vfs
             .lookup(

@@ -579,6 +579,10 @@ pub struct Context {
     /// this group in their supplementary group list so that objects created
     /// in setgid directories get the correct group ownership.
     pub supp_gid: Option<libc::gid_t>,
+
+    /// The unique ID of the request, as passed to `FileSystem::interrupt()` when the kernel
+    /// interrupts this request. 0 if the context doesn't belong to a FUSE request.
+    pub unique: u64,
 }
 
 impl Context {
@@ -595,6 +599,7 @@ impl From<&fuse::InHeader> for Context {
             gid: source.gid,
             pid: source.pid as i32,
             supp_gid: None,
+            unique: source.unique,
         }
     }
 }
@@ -621,6 +626,7 @@ mod tests {
         assert_eq!(header.uid, 3);
         assert_eq!(header.gid, 4);
         assert_eq!(header.pid, 5);
+        assert_eq!(header.unique, 1);
     }
 
     #[test]

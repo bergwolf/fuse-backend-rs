@@ -232,6 +232,7 @@ mod tests {
             gid: 0,
             pid: 0,
             supp_gid: None,
+            ..Default::default()
         };
 
         assert!(vfs.mount(Box::new(fs), "/x/y").is_ok());

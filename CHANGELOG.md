@@ -60,6 +60,9 @@
   writers for equality was never meaningful (they wrap a mutable reply buffer)
   and no code in the workspace relied on it.
 
+- [3](https://github.com/bergwolf/fuse-backend-rs/pull/3): `Context` gains the public `unique` field; code that builds a
+  `Context` with a struct literal must add it (or use `..Default::default()`).
+
 ### Removed
 - [254](https://github.com/cloud-hypervisor/fuse-backend-rs/pull/254): Drop the vestigial `vhost` and `virtio-bindings` dependencies that the
   pre-split `vhost-user-fs` build carried but never referenced; `vhost-user-fs`

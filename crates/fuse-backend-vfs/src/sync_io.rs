@@ -771,6 +771,7 @@ mod tests {
             gid: 100123,
             pid: 1,
             supp_gid: None,
+            ..Default::default()
         };
 
         vfs.id_remap(&mut ctx).unwrap();
@@ -791,6 +792,7 @@ mod tests {
             gid: 100123,
             pid: 1,
             supp_gid: None,
+            ..Default::default()
         };
 
         // fs_idx == 0 (pseudo fs) falls back to global mapping
@@ -816,6 +818,7 @@ mod tests {
             gid: 100123,
             pid: 1,
             supp_gid: Some(100123),
+            ..Default::default()
         };
         vfs.remap_ctx_supp_gid(&mut ctx, 0);
         assert_eq!(ctx.supp_gid, Some(123));
@@ -827,6 +830,7 @@ mod tests {
             gid: 100123,
             pid: 1,
             supp_gid: Some(5),
+            ..Default::default()
         };
         vfs.remap_ctx_supp_gid(&mut ctx, 0);
         assert_eq!(ctx.supp_gid, None);
@@ -838,6 +842,7 @@ mod tests {
             gid: 0,
             pid: 1,
             supp_gid: Some(123),
+            ..Default::default()
         };
         vfs.remap_ctx_supp_gid(&mut ctx, 0);
         assert_eq!(ctx.supp_gid, Some(123));
