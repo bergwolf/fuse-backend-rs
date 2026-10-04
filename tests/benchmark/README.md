@@ -34,7 +34,11 @@ the reply into an in-memory `Writer`, so no syscalls are involved. Before
 the criterion timings it prints the number of heap allocations per request,
 counted by a global allocator wrapper.
 
-Covered operations: `getattr`, `lookup`, `read` (4KB) and `write` (4KB).
+Covered operations: `getattr`, `lookup`, `read` (4KB) and `write` (4KB),
+plus `read_4k_file` and `write_4k_file`, which transfer the data from/to a
+real (page cached) file through the same vectored file IO path as the fusedev
+transport, so that allocations in the syscall wrappers are counted too; their
+timings include the `pread`/`pwrite` syscall.
 
 ```sh
 cd tests/benchmark

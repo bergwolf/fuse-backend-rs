@@ -13,6 +13,11 @@
 //! allocations) from the kernel, the `/dev/fuse` syscalls and real file system
 //! work.
 //!
+//! The `read_4k_file` and `write_4k_file` cases serve the data from a real
+//! (page cached) file instead, through the same vectored file IO path as the
+//! fusedev transport, so that allocations in the syscall wrappers are counted
+//! too. Their timings include the `pread`/`pwrite` syscall.
+//!
 //! Before the timings, the number of heap allocations per request is printed
 //! for each operation, counted by a global allocator wrapper.
 //!
@@ -21,8 +26,10 @@
 
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::ffi::CStr;
+use std::fs::File;
 use std::io;
-use std::mem::size_of;
+use std::mem::{size_of, ManuallyDrop};
+use std::os::unix::io::{AsRawFd, FromRawFd};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
@@ -36,8 +43,12 @@ use fuse_backend_rs::api::server::Server;
 use fuse_backend_rs::file_buf::FileVolatileSlice;
 use fuse_backend_rs::file_traits::FileReadWriteVolatile;
 use fuse_backend_rs::transport::{FuseBuf, FuseDevReaderExt, Reader, Writer};
+use vmm_sys_util::tempfile::TempFile;
 
 const DATA_SIZE: usize = 4096;
+
+/// Requests with this file handle are served from the real backing file.
+const FILE_HANDLE: u64 = 1;
 
 /// Global allocator counting heap allocations.
 struct CountingAlloc;
@@ -106,8 +117,21 @@ impl FileReadWriteVolatile for NullFile {
     }
 }
 
-/// A file system that does no work.
-struct NoopFs;
+/// A file system that does no work, except for requests with `FILE_HANDLE`,
+/// which transfer the data from/to a real file.
+struct NoopFs {
+    file: File,
+}
+
+impl NoopFs {
+    /// Borrow the backing file as an owned `File` without `dup()`, the same
+    /// way `PassthroughFs` does on its read/write path.
+    fn backing_file(&self) -> ManuallyDrop<File> {
+        // Safe because the returned `File` is never dropped, so it doesn't
+        // close the fd, which `self.file` keeps open.
+        ManuallyDrop::new(unsafe { File::from_raw_fd(self.file.as_raw_fd()) })
+    }
+}
 
 fn attr() -> libc::stat64 {
     // Safe because stat64 is plain old data.
@@ -147,21 +171,25 @@ impl FileSystem for NoopFs {
         &self,
         _ctx: &Context,
         _inode: u64,
-        _handle: u64,
+        handle: u64,
         w: &mut dyn ZeroCopyWriter,
         size: u32,
         offset: u64,
         _lock_owner: Option<u64>,
         _flags: u32,
     ) -> io::Result<usize> {
-        w.write_from(&mut NullFile, size as usize, offset)
+        if handle == FILE_HANDLE {
+            w.write_from(&mut *self.backing_file(), size as usize, offset)
+        } else {
+            w.write_from(&mut NullFile, size as usize, offset)
+        }
     }
 
     fn write(
         &self,
         _ctx: &Context,
         _inode: u64,
-        _handle: u64,
+        handle: u64,
         r: &mut dyn ZeroCopyReader,
         size: u32,
         offset: u64,
@@ -170,7 +198,11 @@ impl FileSystem for NoopFs {
         _flags: u32,
         _fuse_flags: u32,
     ) -> io::Result<usize> {
-        r.read_to(&mut NullFile, size as usize, offset)
+        if handle == FILE_HANDLE {
+            r.read_to(&mut *self.backing_file(), size as usize, offset)
+        } else {
+            r.read_to(&mut NullFile, size as usize, offset)
+        }
     }
 }
 
@@ -204,7 +236,8 @@ impl Writer for MemWriter<'_> {
         // Safe because the slice is within `self.buf`, which outlives it.
         let slice =
             unsafe { FileVolatileSlice::from_mut_slice(&mut self.buf[self.pos..self.pos + count]) };
-        let cnt = src.read_at_volatile(slice, off)?;
+        // Go through the vectored variant, like `FuseDevWriter::write_from_at()`.
+        let cnt = src.read_vectored_at_volatile(std::slice::from_ref(&slice), off)?;
         self.pos += cnt;
         Ok(cnt)
     }
@@ -260,6 +293,14 @@ fn requests() -> Vec<(&'static str, Vec<u8>)> {
         size: DATA_SIZE as u32,
         ..Default::default()
     };
+    let read_file_in = ReadIn {
+        fh: FILE_HANDLE,
+        ..read_in
+    };
+    let write_file_in = WriteIn {
+        fh: FILE_HANDLE,
+        ..write_in
+    };
     vec![
         (
             "getattr",
@@ -270,6 +311,11 @@ fn requests() -> Vec<(&'static str, Vec<u8>)> {
         (
             "write_4k",
             request(Opcode::Write, &write_in, &[0xa5u8; DATA_SIZE]),
+        ),
+        ("read_4k_file", request(Opcode::Read, &read_file_in, &[])),
+        (
+            "write_4k_file",
+            request(Opcode::Write, &write_file_in, &[0xa5u8; DATA_SIZE]),
         ),
     ]
 }
@@ -282,8 +328,12 @@ struct Dispatcher {
 
 impl Dispatcher {
     fn new() -> Self {
+        // The temporary file is unlinked when `TempFile` is dropped, the
+        // open `File` stays usable.
+        let file = TempFile::new().unwrap().into_file();
+        file.set_len(DATA_SIZE as u64).unwrap();
         Dispatcher {
-            server: Server::new(NoopFs),
+            server: Server::new(NoopFs { file }),
             reply: vec![0u8; DATA_SIZE + 4096],
         }
     }
@@ -312,7 +362,7 @@ fn print_allocations() {
             dispatcher.dispatch(&mut req);
         }
         let allocs = ALLOCATIONS.load(Ordering::Relaxed) - before;
-        println!("  {:<10} {:.2}", name, allocs as f64 / ITERATIONS as f64);
+        println!("  {:<14} {:.2}", name, allocs as f64 / ITERATIONS as f64);
     }
 }
 
