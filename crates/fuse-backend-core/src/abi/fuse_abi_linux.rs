@@ -84,6 +84,9 @@ const FOPEN_CACHE_DIR: u32 = 8;
 /// the file is stream-like (no file position at all)
 const FOPEN_STREAM: u32 = 16;
 
+/// Passthrough read/write IO for this open file to the backing file in `OpenOut::passthrough`.
+const FOPEN_PASSTHROUGH: u32 = 1 << 7;
+
 bitflags! {
     /// Options controlling the behavior of files opened by the server in response
     /// to an open or create request.
@@ -98,6 +101,13 @@ bitflags! {
         const CACHE_DIR = FOPEN_CACHE_DIR;
         /// the file is stream-like (no file position at all)
         const STREAM = FOPEN_STREAM;
+        /// Kernel FUSE passthrough (`FsOptions::PASSTHROUGH`): read/write/mmap IO on this open
+        /// file goes directly to the backing file whose id is returned in `OpenOut::passthrough`.
+        ///
+        /// The kernel only accepts `DIRECT_IO`, `PARALLEL_DIRECT_WRITES` and `NOFLUSH` together
+        /// with this flag (it fails the open with `EIO` otherwise), and requires every concurrent
+        /// open of an inode to use passthrough with the same backing file.
+        const PASSTHROUGH = FOPEN_PASSTHROUGH;
     }
 }
 
@@ -196,6 +206,10 @@ const INIT_EXT: u64 = 0x4000_0000;
 
 // This flag indicates whether the guest kernel enable per-file dax
 const PERFILE_DAX: u64 = 0x2_0000_0000;
+
+// The daemon may reply to open/create with FOPEN_PASSTHROUGH and a backing file id
+// registered through the FUSE_DEV_IOC_BACKING_OPEN ioctl (protocol 7.40, kernel 6.9+).
+const PASSTHROUGH: u64 = 1_u64 << 37;
 
 // this flag indicates whether the guest kernel enable resend
 const HAS_RESEND: u64 = 1_u64 << 39;
@@ -473,6 +487,18 @@ bitflags! {
 
         /// indicates whether the kernel support resend inflight request
         const HAS_RESEND = HAS_RESEND;
+
+        /// Kernel FUSE passthrough (protocol 7.40, Linux 6.9+, `CONFIG_FUSE_PASSTHROUGH`).
+        ///
+        /// Lets the daemon register an open file with the kernel (`FUSE_DEV_IOC_BACKING_OPEN`)
+        /// and reply to open/create with `OpenOptions::PASSTHROUGH` and the returned backing id,
+        /// so that read/write/splice/mmap on the file are served by the kernel directly from the
+        /// backing file without round trips to the daemon.
+        ///
+        /// The kernel ignores this flag if `WRITEBACK_CACHE` is enabled too, or if the INIT reply
+        /// doesn't carry a valid `max_stack_depth` (see `Server::set_max_stack_depth()`).
+        /// Registering backing files requires `CAP_SYS_ADMIN`.
+        const PASSTHROUGH = PASSTHROUGH;
 
         /// Daemon supports serving FUSE requests over io_uring (experimental).
         #[cfg(feature = "fusedev-uring")]
@@ -994,6 +1020,7 @@ unsafe impl ByteValued for CreateIn {}
 pub struct OpenOut {
     pub fh: u64,
     pub open_flags: u32,
+    /// Backing file id for `OpenOptions::PASSTHROUGH` (`backing_id` in the kernel ABI).
     pub passthrough: u32,
 }
 unsafe impl ByteValued for OpenOut {}
@@ -1151,9 +1178,24 @@ pub struct InitOut {
     pub max_pages: u16,
     pub map_alignment: u16,
     pub flags2: u32,
-    pub unused: [u32; 7],
+    /// Maximum filesystem stacking depth of FUSE passthrough backing files.
+    pub max_stack_depth: u32,
+    pub unused: [u32; 6],
 }
 unsafe impl ByteValued for InitOut {}
+
+/// Argument of the `FUSE_DEV_IOC_BACKING_OPEN` ioctl (`struct fuse_backing_map`).
+#[repr(C)]
+#[derive(Debug, Default, Copy, Clone)]
+pub struct FuseBackingMap {
+    /// File descriptor of the backing file.
+    pub fd: i32,
+    /// Must be zero.
+    pub flags: u32,
+    /// Must be zero.
+    pub padding: u64,
+}
+unsafe impl ByteValued for FuseBackingMap {}
 
 /// Extension type: supplementary group extension (`SuppGroups`).
 ///
@@ -1437,6 +1479,9 @@ mod tests {
         assert_eq!(std::mem::size_of::<MkdirIn>(), 8);
         assert_eq!(std::mem::size_of::<InHeader>(), 40);
         assert_eq!(std::mem::size_of::<OutHeader>(), 16);
+        assert_eq!(std::mem::size_of::<InitOut>(), 64);
+        assert_eq!(std::mem::size_of::<OpenOut>(), 16);
+        assert_eq!(std::mem::size_of::<FuseBackingMap>(), 16);
     }
 
     #[test]

@@ -66,6 +66,9 @@
 
 - [3](https://github.com/bergwolf/fuse-backend-rs/pull/3): `Context` gains the public `unique` field; code that builds a
   `Context` with a struct literal must add it (or use `..Default::default()`).
+- [3](https://github.com/bergwolf/fuse-backend-rs/pull/3): `InitOut` gains the `max_stack_depth` field, carved out of
+  `unused` (now `[u32; 6]`, the struct size is unchanged); code that builds
+  an `InitOut` with a struct literal must adapt.
 
 ### Removed
 - [254](https://github.com/cloud-hypervisor/fuse-backend-rs/pull/254): Drop the vestigial `vhost` and `virtio-bindings` dependencies that the
