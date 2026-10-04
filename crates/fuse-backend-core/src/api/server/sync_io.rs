@@ -1268,7 +1268,13 @@ impl<F: FileSystem + Sync> Server<F> {
         }
     }
 
-    pub(super) fn interrupt<S: BitmapSlice, W: Writer>(&self, _ctx: SrvContext<'_, F, S, W>) {}
+    pub(super) fn interrupt<S: BitmapSlice, W: Writer>(&self, mut ctx: SrvContext<'_, F, S, W>) {
+        // FUSE_INTERRUPT has no reply, a malformed message is simply dropped.
+        match ctx.r.read_obj::<InterruptIn>() {
+            Ok(InterruptIn { unique }) => self.fs.interrupt(ctx.context(), unique),
+            Err(e) => warn!("fuse: failed to decode interrupt request: {:?}", e),
+        }
+    }
 
     pub(super) fn bmap<S: BitmapSlice, W: Writer>(
         &self,
@@ -2097,6 +2103,54 @@ mod tests {
         server.set_max_write(0);
         let out = init(&server);
         assert_eq!(out.max_pages, super::super::MAX_REQ_PAGES);
+    }
+
+    #[test]
+    fn test_server_interrupt() {
+        use std::sync::Mutex;
+
+        #[derive(Default)]
+        struct InterruptFs(Mutex<Vec<(u64, libc::pid_t)>>);
+        impl FileSystem for InterruptFs {
+            type Inode = u64;
+            type Handle = u64;
+
+            fn interrupt(&self, ctx: &crate::api::filesystem::Context, unique: u64) {
+                self.0.lock().unwrap().push((unique, ctx.pid));
+            }
+        }
+
+        let server = Server::new(InterruptFs::default());
+        let in_header = InHeader {
+            len: (size_of::<InHeader>() + size_of::<InterruptIn>()) as u32,
+            opcode: Opcode::Interrupt as u32,
+            unique: 43,
+            pid: 1234,
+            ..Default::default()
+        };
+        let mut read_buf = Vec::new();
+        read_buf.extend_from_slice(in_header.as_slice());
+        read_buf.extend_from_slice(InterruptIn { unique: 42 }.as_slice());
+        let mut write_buf = [0u8; 4096];
+        let reader = Reader::<()>::from_slice(&mut read_buf);
+        let writer = TestWriter::new(&mut write_buf);
+
+        // The interrupt is forwarded to the file system, and nothing is
+        // replied.
+        let res = server.handle_message(reader, writer, None, None).unwrap();
+        assert_eq!(res, 0);
+        assert!(write_buf.iter().all(|&b| b == 0));
+        assert_eq!(*server.fs.0.lock().unwrap(), vec![(42, 1234)]);
+
+        // A truncated message is dropped without a reply.
+        let mut read_buf = Vec::new();
+        read_buf.extend_from_slice(in_header.as_slice());
+        let reader = Reader::<()>::from_slice(&mut read_buf);
+        let writer = TestWriter::new(&mut write_buf);
+        let res = server.handle_message(reader, writer, None, None).unwrap();
+        assert_eq!(res, 0);
+        assert!(write_buf.iter().all(|&b| b == 0));
+        assert_eq!(server.fs.0.lock().unwrap().len(), 1);
     }
 
     #[test]

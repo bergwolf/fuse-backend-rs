@@ -72,6 +72,14 @@ impl FileSystem for Vfs {
         }
     }
 
+    fn interrupt(&self, ctx: &Context, unique: u64) {
+        // The request may be served by any backend, the unknown ones ignore it.
+        let superblocks = self.superblocks.load();
+        for fs in superblocks.iter().flatten() {
+            fs.interrupt(ctx, unique);
+        }
+    }
+
     fn lookup(&self, ctx: &Context, parent: VfsInode, name: &CStr) -> Result<Entry> {
         // Don't use is_safe_path_component(), allow "." and ".." for NFS export support
         if name.to_bytes_with_nul().contains(&SLASH_ASCII) {

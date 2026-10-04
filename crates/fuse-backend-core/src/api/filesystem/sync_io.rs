@@ -68,6 +68,15 @@ pub trait FileSystem {
     /// communicate with the kernel.
     fn destroy(&self) {}
 
+    /// Interrupt a pending request.
+    ///
+    /// Called when the kernel asks to interrupt the request identified by `unique`
+    /// (`Context::unique` of that request), typically because the calling process received a
+    /// signal. No reply is sent for this message. The file system may abort the interrupted
+    /// request and reply to it with `EINTR`, or ignore the interrupt and complete the request
+    /// normally; the request may also have completed already, or not have been received yet.
+    fn interrupt(&self, ctx: &Context, unique: u64) {}
+
     /// Look up a directory entry by name and get its attributes.
     ///
     /// If this call is successful then the lookup count of the `Inode` associated with the returned
@@ -957,6 +966,10 @@ impl<FS: FileSystem> FileSystem for Arc<FS> {
 
     fn destroy(&self) {
         self.deref().destroy()
+    }
+
+    fn interrupt(&self, ctx: &Context, unique: u64) {
+        self.deref().interrupt(ctx, unique)
     }
 
     fn lookup(&self, ctx: &Context, parent: Self::Inode, name: &CStr) -> io::Result<Entry> {

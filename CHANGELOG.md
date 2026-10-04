@@ -23,6 +23,10 @@
   `FuseSession::set_bufsize()` sizes the fuse device buffers to match. The
   benchmark daemon exposes them as `--max-write`, and
   `tests/scripts/bench_sync_async.sh` gains the `BS` and `MAX_WRITE` tunables.
+- [3](https://github.com/bergwolf/fuse-backend-rs/pull/3): Forward `FUSE_INTERRUPT` to the new `FileSystem::interrupt()`
+  (default no-op; `Vfs` forwards it to every mounted file system), and add
+  `Context::unique` so that file systems can match an interrupt with the
+  request it targets.
 
 ### Changed
 - [254](https://github.com/cloud-hypervisor/fuse-backend-rs/pull/254): `fuse-backend-rs` is now a thin facade re-exporting the sub-crates. Every
