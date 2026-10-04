@@ -94,6 +94,13 @@
   to 512 bytes (file names) are copied to the stack. The dispatch
   micro-benchmark goes from 3-4 heap allocations to none per request and is
   22-45% faster.
+- [3](https://github.com/bergwolf/fuse-backend-rs/pull/3): `File`'s vectored volatile IO (`read_vectored_volatile()`,
+  `read_vectored_at_volatile()` and their write counterparts) uses the plain
+  `read`/`write`/`pread64`/`pwrite64` syscall for a single buffer, always the
+  case on the fusedev path, instead of collecting an iovec `Vec` for
+  `readv`/`preadv`, which saves a heap allocation per read/write request. The
+  dispatch micro-benchmark gains file-backed `read_4k_file`/`write_4k_file`
+  cases to cover that path.
 
 ### Removed
 - [254](https://github.com/cloud-hypervisor/fuse-backend-rs/pull/254): Drop the vestigial `vhost` and `virtio-bindings` dependencies that the
