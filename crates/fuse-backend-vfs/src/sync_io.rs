@@ -432,6 +432,56 @@ impl FileSystem for Vfs {
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
+    fn copy_file_range(
+        &self,
+        ctx: &Context,
+        inode_in: VfsInode,
+        handle_in: u64,
+        offset_in: u64,
+        inode_out: VfsInode,
+        handle_out: u64,
+        offset_out: u64,
+        len: u64,
+        flags: u64,
+    ) -> Result<usize> {
+        let (root, idata_in) = self.get_real_rootfs(inode_in)?;
+        let (_, idata_out) = self.get_real_rootfs(inode_out)?;
+
+        // Files of different backends can't be copied by one of them, let the
+        // kernel fall back to the generic copy.
+        if idata_in.fs_idx() != idata_out.fs_idx() {
+            return Err(Error::from_raw_os_error(libc::EXDEV));
+        }
+
+        let res = match root {
+            // The pseudo filesystem only holds directories.
+            Left(_) => Err(Error::from_raw_os_error(libc::EOPNOTSUPP)),
+            Right(fs) => fs.copy_file_range(
+                ctx,
+                idata_in.ino(),
+                handle_in,
+                offset_in,
+                idata_out.ino(),
+                handle_out,
+                offset_out,
+                len,
+                flags,
+            ),
+        };
+        // ENOSYS makes the kernel disable copy_file_range for the whole
+        // mount, so do not let a backend without support turn it off for the
+        // other backends; EOPNOTSUPP falls back to the generic copy for this
+        // call only.
+        res.map_err(|e| {
+            if e.raw_os_error() == Some(libc::ENOSYS) {
+                Error::from_raw_os_error(libc::EOPNOTSUPP)
+            } else {
+                e
+            }
+        })
+    }
+
     fn release(
         &self,
         ctx: &Context,
