@@ -42,6 +42,9 @@
   off for the session when the kernel refuses to register a backing file.
   The benchmark daemon exposes it as `--passthrough`, and
   `tests/scripts/bench_sync_async.sh` gains the `DAEMON_ARGS` tunable.
+- [3](https://github.com/bergwolf/fuse-backend-rs/pull/3): `tests/benchmark/benches/dispatch_microbench.rs` measures the
+  per-request decode/dispatch/encode overhead of the fusedev path and the
+  heap allocations per request.
 
 ### Changed
 - [254](https://github.com/cloud-hypervisor/fuse-backend-rs/pull/254): `fuse-backend-rs` is now a thin facade re-exporting the sub-crates. Every

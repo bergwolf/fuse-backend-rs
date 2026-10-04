@@ -24,6 +24,23 @@ Note that the async numbers include the runtime dispatch cost
 of delegation itself; they do not predict end-to-end throughput, because the
 fuse transport and request concurrency dominate there.
 
+### Request dispatch micro-benchmark
+
+`benches/dispatch_microbench.rs` measures the per-request framework
+overhead of the fusedev path: each iteration decodes a FUSE request from a
+buffer (`Reader::from_fuse_buffer()`), dispatches it through
+`Server::handle_message()` to a file system that does no work, and encodes
+the reply into an in-memory `Writer`, so no syscalls are involved. Before
+the criterion timings it prints the number of heap allocations per request,
+counted by a global allocator wrapper.
+
+Covered operations: `getattr`, `lookup`, `read` (4KB) and `write` (4KB).
+
+```sh
+cd tests/benchmark
+cargo bench --bench dispatch_microbench
+```
+
 ## 2. End-to-end comparison with fio
 
 `tests/scripts/bench_sync_async.sh` mounts the `fuse-backend-rs-benchmark`
