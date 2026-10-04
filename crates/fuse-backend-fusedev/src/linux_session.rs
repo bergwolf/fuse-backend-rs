@@ -206,6 +206,18 @@ impl FuseSession {
         self.bufsize
     }
 
+    /// Set the buffer size of the channels created by the session, the default is
+    /// `FUSE_KERN_BUF_PAGES` pages plus `FUSE_HEADER_SIZE` (1MB + 4K with 4K pages).
+    ///
+    /// Must be called before `mount()`: the size is also passed to the kernel as the `max_read`
+    /// mount option, so that read requests never exceed the buffer. To serve writes larger than
+    /// the default, raise the INIT `max_write` with `Server::set_max_write()` as well; the
+    /// buffer must hold `max_write + FUSE_HEADER_SIZE` bytes, or the kernel rejects reads from
+    /// the fuse device with `EINVAL`. Values smaller than the default are ignored.
+    pub fn set_bufsize(&mut self, bufsize: usize) {
+        self.bufsize = std::cmp::max(bufsize, FUSE_KERN_BUF_PAGES * pagesize() + FUSE_HEADER_SIZE);
+    }
+
     /// Mount the fuse mountpoint, building connection with the in kernel fuse driver.
     pub fn mount(&mut self) -> Result<()> {
         let mut flags = self
@@ -223,6 +235,7 @@ impl FuseSession {
             self.allow_other,
             self.target_mntns,
             &self.fusermount,
+            self.bufsize,
         )?;
 
         fcntl(file.as_raw_fd(), FcntlArg::F_SETFL(OFlag::O_NONBLOCK))
@@ -569,6 +582,7 @@ fn fuse_kern_mount(
     allow_other: bool,
     target_mntns: Option<libc::pid_t>,
     fusermount: &str,
+    max_read: usize,
 ) -> Result<(File, Option<UnixStream>)> {
     let file = OpenOptions::new()
         .create(false)
@@ -589,7 +603,7 @@ fn fuse_kern_mount(
     // in virtiofs scene max_read can't be adjusted, his default is UINT_MAX, but we don't have to
     // worry about it, because the buffer is allocated by the kernel driver, we just use this buffer
     // to fill the response, so we don't need to do any adjustment.
-    let max_read = FUSE_KERN_BUF_PAGES * pagesize() + FUSE_HEADER_SIZE;
+    // `max_read` is the session buffer size, see `FuseSession::set_bufsize()`.
 
     let mut opts = format!(
         "default_permissions,fd={},rootmode={:o},user_id={},group_id={},max_read={}",
