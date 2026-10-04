@@ -9,14 +9,18 @@
 //! A FUSE session can have multiple FUSE channels so that FUSE requests are handled in parallel.
 
 use std::fs::{File, OpenOptions};
+use std::io;
 use std::ops::Deref;
+use std::os::fd::BorrowedFd;
 use std::os::unix::fs::PermissionsExt;
 use std::os::unix::io::AsRawFd;
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, RwLock};
 
 use crate::{FuseChannelExt, FuseDevReaderExt, FuseSessionExt};
+use fuse_backend_core::abi::fuse_abi::FuseBackingMap;
+use fuse_backend_core::api::filesystem::BackingFileRegistry;
 use mio::{Events, Poll, Token, Waker};
 use nix::errno::Errno;
 use nix::fcntl::{fcntl, FcntlArg, FdFlag, OFlag};
@@ -64,6 +68,7 @@ pub struct FuseSession {
     // fusermount binary, default to fusermount3
     fusermount: String,
     mount_flags: Option<MsFlags>,
+    backing: Arc<FuseBackingRegistry>,
 }
 
 impl FuseSession {
@@ -106,6 +111,7 @@ impl FuseSession {
             fusermount: FUSERMOUNT_BIN.to_string(),
             allow_other: true,
             mount_flags: None,
+            backing: Arc::new(FuseBackingRegistry::default()),
         })
     }
 
@@ -139,7 +145,18 @@ impl FuseSession {
 
     /// Force setting the associated FUSE session file.
     pub fn set_fuse_file(&mut self, file: File) {
+        self.backing.set_file(&file);
         self.file = Some(file);
+    }
+
+    /// Get the FUSE passthrough backing file registry of the session.
+    ///
+    /// The registry may be obtained before the session is mounted, so that it can be handed to
+    /// the file system (e.g. `PassthroughFs::set_backing_registry()`) before serving starts; it
+    /// becomes functional once the session is mounted and the kernel negotiated
+    /// `FsOptions::PASSTHROUGH`.
+    pub fn backing_registry(&self) -> Arc<FuseBackingRegistry> {
+        self.backing.clone()
     }
 
     /// Set custom mount flags for the session.
@@ -240,6 +257,7 @@ impl FuseSession {
 
         fcntl(file.as_raw_fd(), FcntlArg::F_SETFL(OFlag::O_NONBLOCK))
             .map_err(|e| SessionFailure(format!("set fd nonblocking: {e}")))?;
+        self.backing.set_file(&file);
         self.file = Some(file);
         self.keep_alive = socket;
 
@@ -248,6 +266,7 @@ impl FuseSession {
 
     /// Destroy a fuse session.
     pub fn umount(&mut self) -> Result<()> {
+        self.backing.clear();
         // If we have a keep_alive socket, just drop it,
         // and let fusermount do the unmount.
         if let (None, Some(file)) = (self.keep_alive.take(), self.file.take()) {
@@ -311,6 +330,67 @@ impl FuseSession {
             .lock()
             .map_err(|e| SessionFailure(format!("lock wakers: {e}")))?;
         wakers.push(waker);
+        Ok(())
+    }
+}
+
+/// Registry of FUSE passthrough backing files of a [`FuseSession`], see
+/// [`FuseSession::backing_registry()`].
+///
+/// Backing files are registered and unregistered with the `FUSE_DEV_IOC_BACKING_OPEN` and
+/// `FUSE_DEV_IOC_BACKING_CLOSE` ioctls on the session's `/dev/fuse` file, which require
+/// `CAP_SYS_ADMIN`.
+#[derive(Debug, Default)]
+pub struct FuseBackingRegistry {
+    file: RwLock<Option<File>>,
+}
+
+// #define FUSE_DEV_IOC_BACKING_OPEN _IOW(FUSE_DEV_IOC_MAGIC, 1, struct fuse_backing_map)
+nix::ioctl_write_ptr!(fuse_dev_ioc_backing_open, 229, 1, FuseBackingMap);
+// #define FUSE_DEV_IOC_BACKING_CLOSE _IOW(FUSE_DEV_IOC_MAGIC, 2, uint32_t)
+nix::ioctl_write_ptr!(fuse_dev_ioc_backing_close, 229, 2, u32);
+
+impl FuseBackingRegistry {
+    fn set_file(&self, file: &File) {
+        match file.try_clone() {
+            Ok(file) => *self.file.write().unwrap() = Some(file),
+            Err(e) => {
+                warn!("fuse: failed to dup fuse fd for the passthrough backing registry: {e}");
+                self.clear();
+            }
+        }
+    }
+
+    fn clear(&self) {
+        *self.file.write().unwrap() = None;
+    }
+
+    fn with_file<T>(&self, f: impl FnOnce(&File) -> nix::Result<T>) -> io::Result<T> {
+        let file = self.file.read().unwrap();
+        let file = file
+            .as_ref()
+            .ok_or_else(|| io::Error::from_raw_os_error(libc::ENOTCONN))?;
+        f(file).map_err(io::Error::from)
+    }
+}
+
+impl BackingFileRegistry for FuseBackingRegistry {
+    fn open_backing(&self, fd: BorrowedFd<'_>) -> io::Result<u32> {
+        let map = FuseBackingMap {
+            fd: fd.as_raw_fd(),
+            ..Default::default()
+        };
+        // Safe because the kernel only reads `map`, which outlives the call.
+        let id =
+            self.with_file(|file| unsafe { fuse_dev_ioc_backing_open(file.as_raw_fd(), &map) })?;
+        Ok(id as u32)
+    }
+
+    fn close_backing(&self, backing_id: u32) -> io::Result<()> {
+        // Safe because the kernel only reads `backing_id`, which outlives the call.
+        self.with_file(|file| unsafe {
+            fuse_dev_ioc_backing_close(file.as_raw_fd(), &backing_id)
+        })?;
         Ok(())
     }
 }
