@@ -37,6 +37,15 @@ impl FileSystem for Vfs {
             if n_opts.no_writeback {
                 n_opts.out_opts.remove(FsOptions::WRITEBACK_CACHE);
             }
+            // The kernel ignores FUSE_PASSTHROUGH when the writeback cache is enabled too, so
+            // let the explicit (non-default) passthrough request win.
+            if n_opts.out_opts.contains(FsOptions::PASSTHROUGH)
+                && opts.contains(FsOptions::PASSTHROUGH)
+                && n_opts.out_opts.contains(FsOptions::WRITEBACK_CACHE)
+            {
+                info!("vfs: disable writeback cache, which conflicts with FUSE passthrough");
+                n_opts.out_opts.remove(FsOptions::WRITEBACK_CACHE);
+            }
             if !n_opts.killpriv_v2 {
                 n_opts.out_opts.remove(FsOptions::HANDLE_KILLPRIV_V2);
             }

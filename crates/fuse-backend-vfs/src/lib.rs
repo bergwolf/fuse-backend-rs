@@ -189,6 +189,10 @@ pub struct VfsOptions {
     /// File system options passed in from client
     pub in_opts: FsOptions,
     /// File system options returned to client
+    ///
+    /// Add `FsOptions::PASSTHROUGH` (not enabled by default) and set `no_open` to false to let
+    /// backend file systems use kernel FUSE passthrough; `WRITEBACK_CACHE` is then dropped when
+    /// the kernel supports passthrough, as the kernel doesn't support both together.
     pub out_opts: FsOptions,
     /// Declaration of ID mapping, in the format (internal ID, external ID, range).
     /// For example, (0, 1, 65536) represents mapping the external UID/GID range of `1~65536`
@@ -1507,6 +1511,30 @@ mod tests {
             assert_eq!(opts.killpriv_v2, false);
         }
         assert_eq!(opts.out_opts, out_opts & in_opts);
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn test_vfs_init_passthrough() {
+        let mut opts = VfsOptions::default();
+        opts.out_opts |= FsOptions::PASSTHROUGH;
+        let in_opts = FsOptions::WRITEBACK_CACHE | FsOptions::PASSTHROUGH;
+
+        // Requested passthrough wins over the writeback cache, which the kernel doesn't
+        // support together.
+        let vfs = Vfs::new(opts);
+        let out = vfs.init(in_opts).unwrap();
+        assert_eq!(out, FsOptions::PASSTHROUGH);
+
+        // The writeback cache is kept if the kernel doesn't support passthrough.
+        let vfs = Vfs::new(opts);
+        let out = vfs.init(FsOptions::WRITEBACK_CACHE).unwrap();
+        assert_eq!(out, FsOptions::WRITEBACK_CACHE);
+
+        // Passthrough isn't requested by default.
+        let vfs = Vfs::default();
+        let out = vfs.init(in_opts).unwrap();
+        assert_eq!(out, FsOptions::WRITEBACK_CACHE);
     }
 
     #[test]
