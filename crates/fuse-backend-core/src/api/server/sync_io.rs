@@ -24,6 +24,11 @@ use crate::api::filesystem::{
 use crate::buffer::{pagesize, Reader, Writer};
 use crate::{bytes_to_cstr, encode_io_error_kind, BitmapSlice, Error, Result};
 
+/// Upper bound of a single FUSE_COPY_FILE_RANGE request, the largest page aligned length whose
+/// result still fits into `WriteOut::size`.
+#[cfg(target_os = "linux")]
+const COPY_FILE_RANGE_MAX_LEN: u64 = (u32::MAX as u64) & !0xfff;
+
 /// Parse the request extensions appended by the kernel after the
 /// NUL-terminated name(s) of create/mkdir/symlink/mknod requests, and return
 /// the first supplementary group carried by a FUSE_EXT_GROUPS extension.
@@ -282,6 +287,8 @@ impl<F: FileSystem + Sync> Server<F> {
             x if x == Opcode::Rename2 as u32 => self.rename2(ctx),
             #[cfg(target_os = "linux")]
             x if x == Opcode::Lseek as u32 => self.lseek(ctx),
+            #[cfg(target_os = "linux")]
+            x if x == Opcode::CopyFileRange as u32 => self.copy_file_range(ctx),
             #[cfg(feature = "virtiofs")]
             x if x == Opcode::SetupMapping as u32 => self.setupmapping(ctx, vu_req),
             #[cfg(feature = "virtiofs")]
@@ -1446,6 +1453,48 @@ impl<F: FileSystem + Sync> Server<F> {
         {
             Ok(offset) => {
                 let out = LseekOut { offset };
+
+                ctx.reply_ok(Some(out), None)
+            }
+            Err(e) => ctx.reply_error(e),
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    pub(super) fn copy_file_range<S: BitmapSlice, W: Writer>(
+        &self,
+        mut ctx: SrvContext<'_, F, S, W>,
+    ) -> Result<usize> {
+        let CopyFileRangeIn {
+            fh_in,
+            offset_in,
+            nodeid_out,
+            fh_out,
+            offset_out,
+            len,
+            flags,
+        } = ctx.r.read_obj().map_err(Error::DecodeMessage)?;
+
+        // The number of copied bytes travels back in the 32-bit WriteOut::size, and the kernel
+        // fails the request with EIO if the reply exceeds the requested length, so never ask
+        // the file system for more than fits into the reply.
+        let len = std::cmp::min(len, COPY_FILE_RANGE_MAX_LEN);
+        match self.fs.copy_file_range(
+            ctx.context(),
+            ctx.nodeid(),
+            fh_in.into(),
+            offset_in,
+            nodeid_out.into(),
+            fh_out.into(),
+            offset_out,
+            len,
+            flags,
+        ) {
+            Ok(count) => {
+                let out = WriteOut {
+                    size: std::cmp::min(count as u64, len) as u32,
+                    padding: 0,
+                };
 
                 ctx.reply_ok(Some(out), None)
             }

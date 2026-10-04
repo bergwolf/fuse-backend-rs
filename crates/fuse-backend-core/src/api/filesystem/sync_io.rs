@@ -818,6 +818,33 @@ pub trait FileSystem {
         Err(io::Error::from_raw_os_error(libc::ENOSYS))
     }
 
+    /// Copy a range of data from one open file to another, without bouncing the data through
+    /// the FUSE transport.
+    ///
+    /// Copy up to `len` bytes from `handle_in` of `inode_in`, starting at `offset_in`, to
+    /// `handle_out` of `inode_out`, starting at `offset_out`. `flags` are the flags passed to
+    /// the `copy_file_range(2)` system call. Returns the number of bytes copied, which may be
+    /// less than `len`.
+    ///
+    /// If this method returns an `ENOSYS` error then the kernel will treat that as a permanent
+    /// failure: all future `copy_file_range(2)` calls fall back to the generic read/write copy
+    /// without being forwarded to the file system.
+    #[allow(clippy::too_many_arguments)]
+    fn copy_file_range(
+        &self,
+        ctx: &Context,
+        inode_in: Self::Inode,
+        handle_in: Self::Handle,
+        offset_in: u64,
+        inode_out: Self::Inode,
+        handle_out: Self::Handle,
+        offset_out: u64,
+        len: u64,
+        flags: u64,
+    ) -> io::Result<usize> {
+        Err(io::Error::from_raw_os_error(libc::ENOSYS))
+    }
+
     /// Query file lock status
     fn getlk(
         &self,
@@ -1277,6 +1304,24 @@ impl<FS: FileSystem> FileSystem for Arc<FS> {
         whence: u32,
     ) -> io::Result<u64> {
         self.deref().lseek(ctx, inode, handle, offset, whence)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn copy_file_range(
+        &self,
+        ctx: &Context,
+        inode_in: Self::Inode,
+        handle_in: Self::Handle,
+        offset_in: u64,
+        inode_out: Self::Inode,
+        handle_out: Self::Handle,
+        offset_out: u64,
+        len: u64,
+        flags: u64,
+    ) -> io::Result<usize> {
+        self.deref().copy_file_range(
+            ctx, inode_in, handle_in, offset_in, inode_out, handle_out, offset_out, len, flags,
+        )
     }
 
     /// Query file lock status
