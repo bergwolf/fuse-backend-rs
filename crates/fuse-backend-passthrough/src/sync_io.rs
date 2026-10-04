@@ -1189,24 +1189,27 @@ impl<S: BitmapSlice + Send + Sync> FileSystem for PassthroughFs<S> {
 
         enum Data {
             Handle(Arc<HandleData>),
-            ProcPath(CString),
+            // No open handle, operate on the inode's `O_PATH` file.
+            Inode,
         }
 
         let file = inode_data.get_file()?;
         let data = if self.no_open.load(Ordering::Relaxed) {
-            let pathname = CString::new(format!("{}", file.as_raw_fd()))
-                .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
-            Data::ProcPath(pathname)
+            Data::Inode
         } else {
             // If we have a handle then use it otherwise get a new fd from the inode.
             if let Some(handle) = handle {
                 let hd = self.handle_map.get(handle, inode)?;
                 Data::Handle(hd)
             } else {
-                let pathname = CString::new(format!("{}", file.as_raw_fd()))
-                    .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
-                Data::ProcPath(pathname)
+                Data::Inode
             }
+        };
+        // Path of the inode's file relative to `/proc/self/fd`, for syscalls that cannot
+        // operate on an `O_PATH` fd directly.
+        let proc_path = || {
+            CString::new(format!("{}", file.as_raw_fd()))
+                .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))
         };
 
         if valid.contains(SetattrValid::SIZE) && self.seal_size.load(Ordering::Relaxed) {
@@ -1215,10 +1218,13 @@ impl<S: BitmapSlice + Send + Sync> FileSystem for PassthroughFs<S> {
 
         if valid.contains(SetattrValid::MODE) {
             // Safe because this doesn't modify any memory and we check the return value.
-            let res = unsafe {
-                match data {
-                    Data::Handle(ref h) => libc::fchmod(h.borrow_fd().as_raw_fd(), attr.st_mode),
-                    Data::ProcPath(ref p) => {
+            let res = match data {
+                Data::Handle(ref h) => unsafe {
+                    libc::fchmod(h.borrow_fd().as_raw_fd(), attr.st_mode)
+                },
+                Data::Inode => {
+                    let p = proc_path()?;
+                    unsafe {
                         libc::fchmodat(self.proc_self_fd.as_raw_fd(), p.as_ptr(), attr.st_mode, 0)
                     }
                 }
@@ -1317,9 +1323,36 @@ impl<S: BitmapSlice + Send + Sync> FileSystem for PassthroughFs<S> {
                 Data::Handle(ref h) => unsafe {
                     libc::futimens(h.borrow_fd().as_raw_fd(), tvs.as_ptr())
                 },
-                Data::ProcPath(ref p) => unsafe {
-                    libc::utimensat(self.proc_self_fd.as_raw_fd(), p.as_ptr(), tvs.as_ptr(), 0)
-                },
+                Data::Inode => {
+                    // Update the times through the `O_PATH` fd itself. Resolving the
+                    // `/proc/self/fd/N` magic link instead instantiates a procfs dentry and
+                    // inode for every fd, which shows up on hot paths such as the time flushes
+                    // the kernel sends for each file with writeback cache enabled.
+                    // Safe because this is a constant value and a valid C string.
+                    let empty = unsafe { CStr::from_bytes_with_nul_unchecked(EMPTY_CSTR) };
+                    let res = unsafe {
+                        libc::utimensat(
+                            file.as_raw_fd(),
+                            empty.as_ptr(),
+                            tvs.as_ptr(),
+                            libc::AT_EMPTY_PATH,
+                        )
+                    };
+                    // `utimensat()` supports `AT_EMPTY_PATH` since Linux 5.8.
+                    if res < 0 && io::Error::last_os_error().raw_os_error() == Some(libc::EINVAL) {
+                        let p = proc_path()?;
+                        unsafe {
+                            libc::utimensat(
+                                self.proc_self_fd.as_raw_fd(),
+                                p.as_ptr(),
+                                tvs.as_ptr(),
+                                0,
+                            )
+                        }
+                    } else {
+                        res
+                    }
+                }
             };
             if res < 0 {
                 return Err(io::Error::last_os_error());
@@ -2371,6 +2404,57 @@ mod tests {
         // suid/sgid is dropped because chmod is called
         assert_eq!(attr.st_mode, 0o100777);
         assert_eq!(attr.st_size, 0);
+    }
+
+    #[test]
+    fn test_setattr_times_without_handle() {
+        let (fs, _source) = prepare_fs_tmpdir();
+        let ctx = prepare_context();
+
+        let fname = CString::new("testfile").unwrap();
+        let args = CreateIn {
+            flags: libc::O_WRONLY as u32,
+            mode: 0o644,
+            umask: 0,
+            fuse_flags: 0,
+        };
+        let (file_entry, handle, _, _) = fs.create(&ctx, ROOT_ID, &fname, args).unwrap();
+        fs.release(
+            &ctx,
+            file_entry.inode,
+            0,
+            handle.unwrap(),
+            false,
+            false,
+            None,
+        )
+        .unwrap();
+        let lname = CString::new("testlink").unwrap();
+        let link_entry = fs.symlink(&ctx, &fname, ROOT_ID, &lname).unwrap();
+
+        let valid = SetattrValid::ATIME | SetattrValid::MTIME;
+        for (inode, secs) in [(file_entry.inode, 1_000_000), (link_entry.inode, 2_000_000)] {
+            let (mut attr, _) = fs.getattr(&ctx, inode, None).unwrap();
+            attr.st_atime = secs;
+            attr.st_atime_nsec = 1;
+            attr.st_mtime = secs + 1;
+            attr.st_mtime_nsec = 2;
+            let (attr, _) = fs.setattr(&ctx, inode, attr, None, valid).unwrap();
+            assert_eq!(attr.st_atime, secs);
+            assert_eq!(attr.st_atime_nsec, 1);
+            assert_eq!(attr.st_mtime, secs + 1);
+            assert_eq!(attr.st_mtime_nsec, 2);
+        }
+
+        // Setting the times of the symlink must not touch its target.
+        let (attr, _) = fs.getattr(&ctx, file_entry.inode, None).unwrap();
+        assert_eq!(attr.st_mtime, 1_000_001);
+
+        let valid = SetattrValid::MTIME | SetattrValid::MTIME_NOW;
+        let (attr, _) = fs
+            .setattr(&ctx, file_entry.inode, attr, None, valid)
+            .unwrap();
+        assert!(attr.st_mtime > 1_000_001);
     }
 
     #[test]

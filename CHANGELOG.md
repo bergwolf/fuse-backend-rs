@@ -104,6 +104,12 @@
 - [3](https://github.com/bergwolf/fuse-backend-rs/pull/3): The benchmark daemon serves the sync mode from
   `FuseSession::new_blocking_channel()`, saving the `epoll_wait` syscall per
   request of `new_channel()`.
+- [3](https://github.com/bergwolf/fuse-backend-rs/pull/3): `PassthroughFs::setattr()` without a file handle updates
+  atime/mtime with `utimensat(fd, "", AT_EMPTY_PATH)` on the inode's `O_PATH`
+  fd instead of resolving `/proc/self/fd/N`, which instantiated a procfs
+  dentry and inode per file for the time flushes the kernel sends with
+  writeback cache (e.g. ahead of every unlink). Kernels older than 5.8 fall
+  back to the `/proc/self/fd` path.
 
 ### Removed
 - [254](https://github.com/cloud-hypervisor/fuse-backend-rs/pull/254): Drop the vestigial `vhost` and `virtio-bindings` dependencies that the
