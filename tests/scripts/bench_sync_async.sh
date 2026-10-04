@@ -40,6 +40,9 @@
 #            the INIT max_write/max_pages and the session buffers; the
 #            script also raises /proc/sys/fs/fuse/max_pages_limit (best
 #            effort, needs root) since the kernel caps requests to it
+#   DAEMON_ARGS  extra arguments appended to the daemon command line, e.g.
+#            "--passthrough" for kernel FUSE passthrough (ignored by the
+#            async mode, needs root)
 
 set -euo pipefail
 
@@ -57,6 +60,7 @@ NRFILES=${NRFILES:-50000}
 MODES=${MODES:-"sync async"}
 BS=${BS:-1M}
 MAX_WRITE=${MAX_WRITE:-}
+DAEMON_ARGS=${DAEMON_ARGS:-}
 RESULTS_DIR=${RESULTS_DIR:-$(mktemp -d /tmp/fuse-bench-results.XXXXXX)}
 SRC_DIR="${RESULTS_DIR}/source"
 MNT_DIR="${RESULTS_DIR}/mount"
@@ -130,7 +134,7 @@ start_daemon() {
     local mode_args=$1
     # shellcheck disable=SC2086
     "${DAEMON}" "${SRC_DIR}" "${MNT_DIR}" ${mode_args} --threads "${THREADS}" \
-        ${MAX_WRITE:+--max-write "${MAX_WRITE}"} &
+        ${MAX_WRITE:+--max-write "${MAX_WRITE}"} ${DAEMON_ARGS} &
     DAEMON_PID=$!
     for _ in $(seq 50); do
         # A daemon that mounted and immediately died (rejected session)

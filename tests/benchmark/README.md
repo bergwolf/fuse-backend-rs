@@ -55,6 +55,18 @@ the kernel side. Combine it with a larger `BS` to measure large requests:
 BS=16M MAX_WRITE=16777216 sudo -E tests/scripts/bench_sync_async.sh
 ```
 
+`DAEMON_ARGS` appends extra arguments to the daemon command line. With
+`DAEMON_ARGS=--passthrough` the daemon enables kernel FUSE passthrough
+(`FUSE_PASSTHROUGH`, Linux 6.9+): `PassthroughFs` registers the backing
+file of each opened regular file with the kernel, which then serves reads
+and writes directly from it without sending them to the daemon (the async
+mode ignores the flag). Backing file registration needs `CAP_SYS_ADMIN`, so
+run the script as root:
+
+```sh
+MODES=sync DAEMON_ARGS=--passthrough sudo -E tests/scripts/bench_sync_async.sh
+```
+
 The script builds the daemon in release mode; when invoking it with `sudo`,
 build once as a regular user first (`cd tests/benchmark && cargo build
 --release`) to avoid root-owned artifacts in the workspace `target/`

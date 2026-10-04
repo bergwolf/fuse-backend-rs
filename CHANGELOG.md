@@ -27,6 +27,21 @@
   (default no-op; `Vfs` forwards it to every mounted file system), and add
   `Context::unique` so that file systems can match an interrupt with the
   request it targets.
+- [3](https://github.com/bergwolf/fuse-backend-rs/pull/3): Kernel FUSE passthrough (`FUSE_PASSTHROUGH`, Linux 6.9+). With
+  `passthrough::Config::fuse_passthrough` set and a backing registry from
+  `FuseSession::backing_registry()` installed via
+  `PassthroughFs::set_backing_registry()`, `PassthroughFs` registers the
+  backing file of each opened regular file with the kernel
+  (`FUSE_DEV_IOC_BACKING_OPEN`, one id per inode shared by its handles), and
+  the kernel serves reads, writes and mmap directly from it. New ABI/API
+  pieces: `FsOptions::PASSTHROUGH`, `OpenOptions::PASSTHROUGH`,
+  `FuseBackingMap`, the `BackingFileRegistry` trait and
+  `Server::set_max_stack_depth()`. Passthrough excludes the writeback cache
+  (`Vfs` drops `WRITEBACK_CACHE` when it negotiates passthrough), needs
+  `CAP_SYS_ADMIN`, is only used by the synchronous server, and turns itself
+  off for the session when the kernel refuses to register a backing file.
+  The benchmark daemon exposes it as `--passthrough`, and
+  `tests/scripts/bench_sync_async.sh` gains the `DAEMON_ARGS` tunable.
 
 ### Changed
 - [254](https://github.com/cloud-hypervisor/fuse-backend-rs/pull/254): `fuse-backend-rs` is now a thin facade re-exporting the sub-crates. Every

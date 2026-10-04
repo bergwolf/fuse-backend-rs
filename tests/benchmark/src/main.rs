@@ -7,7 +7,7 @@
 //! and asynchronous IO paths with external tools such as fio.
 //!
 //! Usage: `fuse-backend-rs-benchmark <src> <mountpoint> [--async|--uring] [--threads N]
-//! [--max-write BYTES]`
+//! [--max-write BYTES] [--passthrough]`
 //!
 //! - default (sync) mode: requests are served by `N` worker threads, each
 //!   reading from its own fuse channel (the classic multi-threaded design).
@@ -22,6 +22,11 @@
 //! `--max-write BYTES` raises the INIT `max_write`/`max_pages` and the
 //! session buffers accordingly (default 1MB); the kernel caps the request
 //! size to `/proc/sys/fs/fuse/max_pages_limit` pages.
+//!
+//! `--passthrough` enables kernel FUSE passthrough (Linux 6.9+, requires
+//! `CAP_SYS_ADMIN`): read/write of open regular files is served by the kernel
+//! directly from the backing files, and the writeback cache is disabled as the
+//! kernel doesn't support both. Not supported in `--async` mode.
 
 #[cfg(target_os = "linux")]
 mod daemon {
@@ -36,12 +41,13 @@ mod daemon {
     use signal_hook::{consts::TERM_SIGNALS, iterator::Signals};
     use simple_logger::SimpleLogger;
 
+    use fuse_backend_rs::api::filesystem::FsOptions;
     use fuse_backend_rs::api::server::Server;
     use fuse_backend_rs::api::{Vfs, VfsOptions};
     use fuse_backend_rs::passthrough::{Config, PassthroughFs};
     use fuse_backend_rs::transport::{
-        AsyncFuseServing, AsyncServingConfig, FuseChannel, FuseSession, UringConfig,
-        UringFuseServing,
+        AsyncFuseServing, AsyncServingConfig, FuseBackingRegistry, FuseChannel, FuseSession,
+        UringConfig, UringFuseServing,
     };
 
     struct Args {
@@ -51,11 +57,12 @@ mod daemon {
         as_uring: bool,
         thread_cnt: u32,
         max_write: u32,
+        passthrough: bool,
     }
 
     fn help() {
         println!(
-            "Usage:\n   fuse-backend-rs-benchmark <src> <mountpoint> [--async|--uring] [--threads N] [--max-write BYTES]\n"
+            "Usage:\n   fuse-backend-rs-benchmark <src> <mountpoint> [--async|--uring] [--threads N] [--max-write BYTES] [--passthrough]\n"
         );
     }
 
@@ -72,12 +79,14 @@ mod daemon {
             as_uring: false,
             thread_cnt: 4,
             max_write: 0,
+            passthrough: false,
         };
         let mut idx = 3;
         while idx < args.len() {
             match args[idx].as_str() {
                 "--async" => res.as_async = true,
                 "--uring" => res.as_uring = true,
+                "--passthrough" => res.passthrough = true,
                 "--threads" => {
                     idx += 1;
                     if idx >= args.len() {
@@ -118,20 +127,32 @@ mod daemon {
         Ok(res)
     }
 
-    fn create_server(src: &str) -> Arc<Server<Arc<Vfs>>> {
-        let vfs = Vfs::new(VfsOptions {
+    fn create_server(
+        src: &str,
+        backing_registry: Option<Arc<FuseBackingRegistry>>,
+    ) -> Arc<Server<Arc<Vfs>>> {
+        let mut opts = VfsOptions {
             no_open: false,
             no_opendir: false,
             ..Default::default()
-        });
+        };
+        if backing_registry.is_some() {
+            // Vfs drops the writeback cache, which conflicts with passthrough.
+            opts.out_opts |= FsOptions::PASSTHROUGH;
+        }
+        let vfs = Vfs::new(opts);
 
         let cfg = Config {
             root_dir: src.to_string(),
             do_import: false,
+            fuse_passthrough: backing_registry.is_some(),
             ..Default::default()
         };
         let fs = PassthroughFs::<()>::new(cfg).unwrap();
         fs.import().unwrap();
+        if let Some(registry) = backing_registry {
+            fs.set_backing_registry(registry);
+        }
 
         vfs.mount(Box::new(fs), "/").unwrap();
         Arc::new(Server::new(Arc::new(vfs)))
@@ -268,7 +289,7 @@ mod daemon {
             }
         }
         info!(
-            "passthrough src {} mountpoint {} mode {} threads {}",
+            "passthrough src {} mountpoint {} mode {} threads {} fuse passthrough {}",
             args.src,
             args.dest,
             if args.as_uring {
@@ -279,10 +300,19 @@ mod daemon {
                 "sync"
             },
             args.thread_cnt,
+            args.passthrough,
         );
 
-        let server = create_server(&args.src);
         let mut se = FuseSession::new(Path::new(&args.dest), "bench_passthru", "", false).unwrap();
+        if args.passthrough && args.as_async {
+            warn!("--passthrough is ignored in async mode");
+        }
+        let backing_registry = if args.passthrough && !args.as_async {
+            Some(se.backing_registry())
+        } else {
+            None
+        };
+        let server = create_server(&args.src, backing_registry);
         if args.max_write != 0 {
             // The session buffers must hold the largest request: max_write
             // plus the header area.
