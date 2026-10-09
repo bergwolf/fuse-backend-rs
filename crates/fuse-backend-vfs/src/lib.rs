@@ -31,7 +31,7 @@ use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use arc_swap::ArcSwap;
+use arc_swap::{ArcSwap, Guard};
 
 use fuse_backend_core::abi::fuse_abi::*;
 use fuse_backend_core::api::filesystem::*;
@@ -59,9 +59,30 @@ pub use fuse_backend_core::api::filesystem::{
 const VFS_INDEX_SHIFT: u8 = 56;
 const VFS_PSEUDO_FS_IDX: VfsIndex = 0;
 
-type ArcBackFs = Arc<BackFileSystem>;
 type ArcSuperBlock = ArcSwap<Vec<Option<Arc<BackFileSystem>>>>;
-type VfsEitherFs<'a> = Either<&'a PseudoFs, ArcBackFs>;
+type VfsEitherFs<'a> = Either<&'a PseudoFs, BackFsRef>;
+
+/// A reference to a mounted backend file system.
+///
+/// The reference keeps the snapshot of the superblocks it was taken from, and
+/// so the backend file system, alive. Unlike cloning the `Arc` of the backend
+/// file system, taking and dropping the reference doesn't modify state shared
+/// by all the threads serving requests, which makes it much cheaper on the
+/// per-request hot path when the threads run on different CPUs.
+struct BackFsRef {
+    superblocks: Guard<Arc<Vec<Option<Arc<BackFileSystem>>>>>,
+    idx: usize,
+}
+
+impl Deref for BackFsRef {
+    type Target = BackFileSystem;
+
+    fn deref(&self) -> &BackFileSystem {
+        // The slot was checked to be occupied when the reference was created,
+        // and the snapshot of the superblocks is immutable.
+        self.superblocks[self.idx].as_deref().unwrap()
+    }
+}
 
 type VfsHandle = u64;
 /// Vfs backend file system index
@@ -281,6 +302,9 @@ pub struct Vfs {
     superblocks: ArcSuperBlock,
     // per-mount id_mapping, indexed by fs_idx (parallel to superblocks)
     mount_id_mappings: ArcSwap<Vec<Option<(u32, u32, u32)>>>,
+    // Whether a per-mount id_mapping has ever been set, so that requests can
+    // skip looking up `mount_id_mappings` in the common case of none.
+    has_mount_id_mappings: AtomicBool,
     opts: ArcSwap<VfsOptions>,
     initialized: AtomicBool,
     lock: Mutex<()>,
@@ -302,6 +326,7 @@ impl Vfs {
             mountpoints: ArcSwap::new(Arc::new(HashMap::new())),
             superblocks: ArcSwap::new(Arc::new(vec![None; MAX_VFS_INDEX])),
             mount_id_mappings: ArcSwap::new(Arc::new(vec![None; MAX_VFS_INDEX])),
+            has_mount_id_mappings: AtomicBool::new(false),
             root: PseudoFs::new(),
             opts: ArcSwap::new(Arc::new(opts)),
             lock: Mutex::new(()),
@@ -404,6 +429,7 @@ impl Vfs {
         if id_mapping.is_some() {
             let mut mappings = self.mount_id_mappings.load().deref().deref().clone();
             mappings[index as usize] = id_mapping;
+            self.has_mount_id_mappings.store(true, Ordering::Release);
             self.mount_id_mappings.store(Arc::new(mappings));
         }
         self.insert_mount_locked(fs, entry, index, path)
@@ -539,6 +565,9 @@ impl Vfs {
     /// global `id_mapping` when no per-mount override is set (or when
     /// `fs_idx` refers to the pseudo filesystem).
     fn get_effective_id_mapping(&self, fs_idx: VfsIndex) -> Option<(u32, u32, u32)> {
+        if !self.has_mount_id_mappings.load(Ordering::Acquire) {
+            return self.id_mapping;
+        }
         if let Some(m) = self
             .mount_id_mappings
             .load()
@@ -671,18 +700,29 @@ impl Vfs {
         Err(Error::from_raw_os_error(libc::ENOENT))
     }
 
+    fn get_fs_ref_by_idx(&self, fs_idx: VfsIndex) -> Result<BackFsRef> {
+        let superblocks = self.superblocks.load();
+        let idx = fs_idx as usize;
+
+        if superblocks[idx].is_some() {
+            return Ok(BackFsRef { superblocks, idx });
+        }
+
+        Err(Error::from_raw_os_error(libc::ENOENT))
+    }
+
     fn get_real_rootfs(&self, inode: VfsInode) -> Result<(VfsEitherFs<'_>, VfsInode)> {
         if inode.is_pseudo_fs() {
             // ROOT_ID is special, we need to check if we have a mountpoint on the vfs root
             if inode.ino() == ROOT_ID {
                 if let Some(mnt) = self.mountpoints.load().get(&inode.ino()).cloned() {
-                    let fs = self.get_fs_by_idx(mnt.fs_idx)?;
+                    let fs = self.get_fs_ref_by_idx(mnt.fs_idx)?;
                     return Ok((Right(fs), VfsInode::new(mnt.fs_idx, mnt.ino)));
                 }
             }
             Ok((Left(&self.root), inode))
         } else {
-            let fs = self.get_fs_by_idx(inode.fs_idx())?;
+            let fs = self.get_fs_ref_by_idx(inode.fs_idx())?;
             Ok((Right(fs), inode))
         }
     }
@@ -1004,6 +1044,9 @@ pub mod persist {
                 .iter()
                 .map(|m| m.map(|s| (s.internal_id, s.external_id, s.range)))
                 .collect();
+            if mount_id_mappings.iter().any(|m| m.is_some()) {
+                self.has_mount_id_mappings.store(true, Ordering::Release);
+            }
             self.mount_id_mappings.store(Arc::new(mount_id_mappings));
 
             self.root
