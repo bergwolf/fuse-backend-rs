@@ -15,6 +15,7 @@
 extern crate log;
 
 use std::any::Any;
+use std::cell::RefCell;
 use std::collections::{btree_map, BTreeMap, HashMap};
 use std::ffi::{CStr, CString, OsString};
 use std::fs::File;
@@ -26,7 +27,7 @@ use std::os::unix::ffi::OsStringExt;
 use std::os::unix::io::{AsRawFd, RawFd};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, RwLock, RwLockWriteGuard};
+use std::sync::{Arc, Mutex, RwLock, RwLockWriteGuard, Weak};
 use std::time::Duration;
 
 use vm_memory::{bitmap::BitmapSlice, ByteValued};
@@ -277,6 +278,9 @@ struct HandleData {
     open_flags: RwLock<u32>,
     // Inode whose passthrough backing file is used by this handle.
     backing: Option<Arc<InodeData>>,
+    // Whether the handle has been removed from its `HandleMap`, so that the
+    // per-thread handle cache doesn't hand it out anymore.
+    released: AtomicBool,
 }
 
 impl HandleData {
@@ -286,6 +290,7 @@ impl HandleData {
             file,
             open_flags: RwLock::new(flags),
             backing: None,
+            released: AtomicBool::new(false),
         }
     }
 
@@ -303,7 +308,45 @@ impl HandleData {
     }
 }
 
+/// Number of entries of the per-thread handle cache, see [`HANDLE_CACHE`].
+const HANDLE_CACHE_ENTRIES: usize = 8;
+
+/// Source of the unique ids of [`HandleMap`]s, which key the per-thread
+/// handle cache.
+static NEXT_HANDLE_MAP_ID: AtomicU64 = AtomicU64::new(1);
+
+struct HandleCacheEntry {
+    // Id of the `HandleMap` the handle belongs to, 0 for an empty entry.
+    map: u64,
+    handle: Handle,
+    data: Weak<HandleData>,
+}
+
+const EMPTY_HANDLE_CACHE_ENTRY: HandleCacheEntry = HandleCacheEntry {
+    map: 0,
+    handle: 0,
+    data: Weak::new(),
+};
+
+thread_local! {
+    /// Per-thread, direct mapped cache of [`HandleMap`] lookups.
+    ///
+    /// Looking up a handle in the map takes the read side of the map lock, an
+    /// atomic read-modify-write of a cache line shared by all the threads
+    /// serving requests, which is expensive when the threads run on different
+    /// CPUs. Hits in this cache only touch the handle itself.
+    ///
+    /// Entries hold weak references, so they don't keep the files of released
+    /// handles open. Handles are never reused within a map, and maps are
+    /// identified by a unique id rather than by their address, so a stale
+    /// entry can't alias a newer handle.
+    static HANDLE_CACHE: RefCell<[HandleCacheEntry; HANDLE_CACHE_ENTRIES]> =
+        const { RefCell::new([EMPTY_HANDLE_CACHE_ENTRY; HANDLE_CACHE_ENTRIES]) };
+}
+
 struct HandleMap {
+    // Unique id of the map, see `HANDLE_CACHE`.
+    id: u64,
     handles: RwLock<BTreeMap<Handle, Arc<HandleData>>>,
     /// Sidecar cache of directory cookies, kept out of `HandleData` so that
     /// ordinary (non-directory) handles don't pay for it.
@@ -326,6 +369,7 @@ struct HandleMap {
 impl HandleMap {
     fn new() -> Self {
         HandleMap {
+            id: NEXT_HANDLE_MAP_ID.fetch_add(1, Ordering::Relaxed),
             handles: RwLock::new(BTreeMap::new()),
             cookies: Mutex::new(HashMap::new()),
         }
@@ -333,7 +377,12 @@ impl HandleMap {
 
     fn clear(&self) {
         // Do not expect poisoned lock here, so safe to unwrap().
-        self.handles.write().unwrap().clear();
+        let mut handles = self.handles.write().unwrap();
+        for data in handles.values() {
+            data.released.store(true, Ordering::Release);
+        }
+        handles.clear();
+        drop(handles);
         self.cookies.lock().unwrap().clear();
     }
 
@@ -348,6 +397,7 @@ impl HandleMap {
 
         if let btree_map::Entry::Occupied(e) = handles.entry(handle) {
             if e.get().inode == inode {
+                e.get().released.store(true, Ordering::Release);
                 // We don't need to close the file here because that will happen automatically when
                 // the last `Arc` is dropped.
                 return Ok(e.remove());
@@ -358,14 +408,41 @@ impl HandleMap {
     }
 
     fn get(&self, handle: Handle, inode: Inode) -> io::Result<Arc<HandleData>> {
+        let slot = handle as usize % HANDLE_CACHE_ENTRIES;
+        let cached = HANDLE_CACHE
+            .try_with(|cache| {
+                let entry = &cache.borrow()[slot];
+                if entry.map == self.id && entry.handle == handle {
+                    entry.data.upgrade()
+                } else {
+                    None
+                }
+            })
+            .ok()
+            .flatten();
+        if let Some(hd) = cached {
+            if hd.inode == inode && !hd.released.load(Ordering::Acquire) {
+                return Ok(hd);
+            }
+        }
+
         // Do not expect poisoned lock here, so safe to unwrap().
-        self.handles
+        let hd = self
+            .handles
             .read()
             .unwrap()
             .get(&handle)
             .filter(|hd| hd.inode == inode)
             .cloned()
-            .ok_or_else(ebadf)
+            .ok_or_else(ebadf)?;
+        let _ = HANDLE_CACHE.try_with(|cache| {
+            cache.borrow_mut()[slot] = HandleCacheEntry {
+                map: self.id,
+                handle,
+                data: Arc::downgrade(&hd),
+            };
+        });
+        Ok(hd)
     }
 
     fn set_cookie(&self, handle: Handle, cookie: u64) {
