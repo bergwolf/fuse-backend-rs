@@ -11,8 +11,7 @@ use vm_memory::ByteValued;
 
 use super::{
     encode_version, InitParams, MetricsHook, Server, ServerUtil, ServerVersion, SrvContext,
-    ZcReader, ZcWriter, BUFFER_HEADER_SIZE, DIRENT_PADDING, MAX_BUFFER_SIZE, MAX_REQ_PAGES,
-    MIN_READ_BUFFER,
+    ZcReader, ZcWriter, BUFFER_HEADER_SIZE, DIRENT_PADDING, MIN_READ_BUFFER,
 };
 use crate::abi::fuse_abi::*;
 #[cfg(feature = "virtiofs")]
@@ -23,6 +22,11 @@ use crate::api::filesystem::{
 };
 use crate::buffer::{pagesize, Reader, Writer};
 use crate::{bytes_to_cstr, encode_io_error_kind, BitmapSlice, Error, Result};
+
+/// Upper bound of a single FUSE_COPY_FILE_RANGE request, the largest page aligned length whose
+/// result still fits into `WriteOut::size`.
+#[cfg(target_os = "linux")]
+const COPY_FILE_RANGE_MAX_LEN: u64 = (u32::MAX as u64) & !0xfff;
 
 /// Parse the request extensions appended by the kernel after the
 /// NUL-terminated name(s) of create/mkdir/symlink/mknod requests, and return
@@ -210,7 +214,7 @@ impl<F: FileSystem + Sync> Server<F> {
         let in_header: InHeader = r.read_obj().map_err(Error::DecodeMessage)?;
         let mut ctx = SrvContext::<F, S, W>::new(in_header, r, w);
         self.remap_ctx_ids(&mut ctx)?;
-        if ctx.in_header.len > (MAX_BUFFER_SIZE + BUFFER_HEADER_SIZE) {
+        if ctx.in_header.len > (self.max_buffer_size() + BUFFER_HEADER_SIZE) {
             if in_header.opcode == Opcode::Forget as u32
                 || in_header.opcode == Opcode::BatchForget as u32
             {
@@ -282,6 +286,8 @@ impl<F: FileSystem + Sync> Server<F> {
             x if x == Opcode::Rename2 as u32 => self.rename2(ctx),
             #[cfg(target_os = "linux")]
             x if x == Opcode::Lseek as u32 => self.lseek(ctx),
+            #[cfg(target_os = "linux")]
+            x if x == Opcode::CopyFileRange as u32 => self.copy_file_range(ctx),
             #[cfg(feature = "virtiofs")]
             x if x == Opcode::SetupMapping as u32 => self.setupmapping(ctx, vu_req),
             #[cfg(feature = "virtiofs")]
@@ -967,13 +973,22 @@ impl<F: FileSystem + Sync> Server<F> {
                     flags2: (enabled_flags >> 32) as u32,
                     ..Default::default()
                 };
+                let max_req_pages = self.max_req_pages();
                 if enabled.contains(FsOptions::BIG_WRITES) {
-                    out.max_write = MAX_REQ_PAGES as u32 * pagesize() as u32;
+                    out.max_write = max_req_pages as u32 * pagesize() as u32;
                 }
                 #[cfg(target_os = "linux")]
                 if enabled.contains(FsOptions::MAX_PAGES) {
-                    out.max_pages = MAX_REQ_PAGES;
-                    out.max_write = MAX_REQ_PAGES as u32 * pagesize() as u32; // 1MB
+                    out.max_pages = max_req_pages;
+                    // 1MB by default, see set_max_write().
+                    out.max_write = max_req_pages as u32 * pagesize() as u32;
+                }
+                #[cfg(target_os = "linux")]
+                if enabled.contains(FsOptions::PASSTHROUGH) {
+                    if enabled.contains(FsOptions::WRITEBACK_CACHE) {
+                        warn!("fuse: the kernel disables FUSE passthrough with writeback cache");
+                    }
+                    out.max_stack_depth = self.max_stack_depth.load(Ordering::Relaxed);
                 }
                 self.vers.store(
                     encode_version(version.major, version.minor),
@@ -1260,7 +1275,13 @@ impl<F: FileSystem + Sync> Server<F> {
         }
     }
 
-    pub(super) fn interrupt<S: BitmapSlice, W: Writer>(&self, _ctx: SrvContext<'_, F, S, W>) {}
+    pub(super) fn interrupt<S: BitmapSlice, W: Writer>(&self, mut ctx: SrvContext<'_, F, S, W>) {
+        // FUSE_INTERRUPT has no reply, a malformed message is simply dropped.
+        match ctx.r.read_obj::<InterruptIn>() {
+            Ok(InterruptIn { unique }) => self.fs.interrupt(ctx.context(), unique),
+            Err(e) => warn!("fuse: failed to decode interrupt request: {:?}", e),
+        }
+    }
 
     pub(super) fn bmap<S: BitmapSlice, W: Writer>(
         &self,
@@ -1380,7 +1401,7 @@ impl<F: FileSystem + Sync> Server<F> {
 
         if let Some(size) = (count as usize).checked_mul(size_of::<ForgetOne>()) {
             if size
-                > (MAX_BUFFER_SIZE + BUFFER_HEADER_SIZE
+                > (self.max_buffer_size() + BUFFER_HEADER_SIZE
                     - size_of::<BatchForgetIn>() as u32
                     - size_of::<InHeader>() as u32) as usize
             {
@@ -1452,6 +1473,48 @@ impl<F: FileSystem + Sync> Server<F> {
             Err(e) => ctx.reply_error(e),
         }
     }
+
+    #[cfg(target_os = "linux")]
+    pub(super) fn copy_file_range<S: BitmapSlice, W: Writer>(
+        &self,
+        mut ctx: SrvContext<'_, F, S, W>,
+    ) -> Result<usize> {
+        let CopyFileRangeIn {
+            fh_in,
+            offset_in,
+            nodeid_out,
+            fh_out,
+            offset_out,
+            len,
+            flags,
+        } = ctx.r.read_obj().map_err(Error::DecodeMessage)?;
+
+        // The number of copied bytes travels back in the 32-bit WriteOut::size, and the kernel
+        // fails the request with EIO if the reply exceeds the requested length, so never ask
+        // the file system for more than fits into the reply.
+        let len = std::cmp::min(len, COPY_FILE_RANGE_MAX_LEN);
+        match self.fs.copy_file_range(
+            ctx.context(),
+            ctx.nodeid(),
+            fh_in.into(),
+            offset_in,
+            nodeid_out.into(),
+            fh_out.into(),
+            offset_out,
+            len,
+            flags,
+        ) {
+            Ok(count) => {
+                let out = WriteOut {
+                    size: std::cmp::min(count as u64, len) as u32,
+                    padding: 0,
+                };
+
+                ctx.reply_ok(Some(out), None)
+            }
+            Err(e) => ctx.reply_error(e),
+        }
+    }
 }
 
 #[cfg(feature = "virtiofs")]
@@ -1497,7 +1560,7 @@ impl<F: FileSystem + Sync> Server<F> {
             let RemovemappingIn { count } = ctx.r.read_obj().map_err(Error::DecodeMessage)?;
 
             if let Some(size) = (count as usize).checked_mul(size_of::<RemovemappingOne>()) {
-                if size > MAX_BUFFER_SIZE as usize {
+                if size > super::MAX_BUFFER_SIZE as usize {
                     return ctx.reply_error(io::Error::from_raw_os_error(libc::ENOMEM));
                 }
             } else {
@@ -1977,6 +2040,274 @@ mod tests {
             out.flags2 & (FsOptions::CREATE_SUPP_GROUP.bits() >> 32) as u32,
             0
         );
+    }
+
+    #[test]
+    fn test_server_init_max_write() {
+        struct MaxPagesFs;
+        impl FileSystem for MaxPagesFs {
+            type Inode = u64;
+            type Handle = u64;
+
+            fn init(&self, capable: FsOptions) -> io::Result<FsOptions> {
+                Ok(capable & (FsOptions::BIG_WRITES | FsOptions::MAX_PAGES))
+            }
+        }
+
+        let init = |server: &Server<MaxPagesFs>| {
+            let mut read_buf = [0u8; size_of::<InitIn>()];
+            let init_in = InitIn {
+                major: KERNEL_VERSION,
+                minor: KERNEL_MINOR_VERSION,
+                max_readahead: 0,
+                flags: (FsOptions::BIG_WRITES | FsOptions::MAX_PAGES).bits() as u32,
+            };
+            read_buf.copy_from_slice(init_in.as_slice());
+            let mut write_buf = [0u8; 4096];
+            let ctx = {
+                let reader = Reader::<()>::from_slice(&mut read_buf);
+                let writer = TestWriter::new(&mut write_buf);
+                SrvContext::new(InHeader::default(), reader, writer)
+            };
+            let res = server.init(ctx, |_| {}).unwrap();
+            assert_eq!(res, size_of::<OutHeader>() + size_of::<InitOut>());
+            let mut out = InitOut::default();
+            out.as_mut_slice()
+                .copy_from_slice(&write_buf[size_of::<OutHeader>()..res]);
+            out
+        };
+        let pagesize = pagesize() as u32;
+
+        // Default: MAX_REQ_PAGES pages.
+        let server = Server::new(MaxPagesFs);
+        let out = init(&server);
+        assert_eq!(out.max_pages, super::super::MAX_REQ_PAGES);
+        assert_eq!(out.max_write, super::super::MAX_REQ_PAGES as u32 * pagesize);
+        assert_eq!(server.max_buffer_size(), super::super::MAX_BUFFER_SIZE);
+
+        // A configured size is rounded up to whole pages, and requests up to
+        // that size are accepted.
+        server.set_max_write(16 * 1024 * 1024 - 1);
+        let out = init(&server);
+        assert_eq!(out.max_write, 16 * 1024 * 1024);
+        assert_eq!(out.max_pages as u32, 16 * 1024 * 1024 / pagesize);
+        assert_eq!(server.max_buffer_size(), 16 * 1024 * 1024);
+
+        // max_pages is a u16.
+        server.set_max_write(u32::MAX);
+        let out = init(&server);
+        assert_eq!(out.max_pages, u16::MAX);
+        assert_eq!(out.max_write, u16::MAX as u32 * pagesize);
+
+        // A smaller max_write doesn't lower the accepted request size.
+        server.set_max_write(1);
+        let out = init(&server);
+        assert_eq!(out.max_pages, 1);
+        assert_eq!(out.max_write, pagesize);
+        assert_eq!(server.max_buffer_size(), super::super::MAX_BUFFER_SIZE);
+
+        // 0 restores the default.
+        server.set_max_write(0);
+        let out = init(&server);
+        assert_eq!(out.max_pages, super::super::MAX_REQ_PAGES);
+    }
+
+    #[test]
+    fn test_server_init_passthrough() {
+        struct PassthroughCapFs;
+        impl FileSystem for PassthroughCapFs {
+            type Inode = u64;
+            type Handle = u64;
+
+            fn init(&self, capable: FsOptions) -> io::Result<FsOptions> {
+                Ok(capable & FsOptions::PASSTHROUGH)
+            }
+        }
+
+        let init = |server: &Server<PassthroughCapFs>, flags2: u32| {
+            let mut read_buf = [0u8; size_of::<InitIn>() + size_of::<InitIn2>()];
+            let init_in = InitIn {
+                major: KERNEL_VERSION,
+                minor: KERNEL_MINOR_VERSION,
+                max_readahead: 0,
+                flags: FsOptions::INIT_EXT.bits() as u32,
+            };
+            read_buf[..size_of::<InitIn>()].copy_from_slice(init_in.as_slice());
+            let init_in2 = InitIn2 {
+                flags2,
+                unused: [0; 11],
+            };
+            read_buf[size_of::<InitIn>()..].copy_from_slice(init_in2.as_slice());
+            let mut write_buf = [0u8; 4096];
+            let ctx = {
+                let reader = Reader::<()>::from_slice(&mut read_buf);
+                let writer = TestWriter::new(&mut write_buf);
+                SrvContext::new(InHeader::default(), reader, writer)
+            };
+            let res = server.init(ctx, |_| {}).unwrap();
+            assert_eq!(res, size_of::<OutHeader>() + size_of::<InitOut>());
+            let mut out = InitOut::default();
+            out.as_mut_slice()
+                .copy_from_slice(&write_buf[size_of::<OutHeader>()..res]);
+            out
+        };
+        let passthrough = (FsOptions::PASSTHROUGH.bits() >> 32) as u32;
+
+        // The kernel only enables passthrough with a max_stack_depth in 1..=2.
+        let server = Server::new(PassthroughCapFs);
+        let out = init(&server, passthrough);
+        assert_ne!(out.flags2 & passthrough, 0);
+        assert_ne!(out.flags & FsOptions::INIT_EXT.bits() as u32, 0);
+        assert_eq!(out.max_stack_depth, super::super::DEFAULT_MAX_STACK_DEPTH);
+
+        server.set_max_stack_depth(2);
+        assert_eq!(init(&server, passthrough).max_stack_depth, 2);
+        server.set_max_stack_depth(0);
+        assert_eq!(init(&server, passthrough).max_stack_depth, 1);
+        server.set_max_stack_depth(3);
+        assert_eq!(init(&server, passthrough).max_stack_depth, 2);
+
+        // Not negotiated.
+        let out = init(&server, 0);
+        assert_eq!(out.flags2 & passthrough, 0);
+        assert_eq!(out.max_stack_depth, 0);
+    }
+
+    #[test]
+    fn test_server_interrupt() {
+        use std::sync::Mutex;
+
+        #[derive(Default)]
+        struct InterruptFs(Mutex<Vec<(u64, libc::pid_t)>>);
+        impl FileSystem for InterruptFs {
+            type Inode = u64;
+            type Handle = u64;
+
+            fn interrupt(&self, ctx: &crate::api::filesystem::Context, unique: u64) {
+                self.0.lock().unwrap().push((unique, ctx.pid));
+            }
+        }
+
+        let server = Server::new(InterruptFs::default());
+        let in_header = InHeader {
+            len: (size_of::<InHeader>() + size_of::<InterruptIn>()) as u32,
+            opcode: Opcode::Interrupt as u32,
+            unique: 43,
+            pid: 1234,
+            ..Default::default()
+        };
+        let mut read_buf = Vec::new();
+        read_buf.extend_from_slice(in_header.as_slice());
+        read_buf.extend_from_slice(InterruptIn { unique: 42 }.as_slice());
+        let mut write_buf = [0u8; 4096];
+        let reader = Reader::<()>::from_slice(&mut read_buf);
+        let writer = TestWriter::new(&mut write_buf);
+
+        // The interrupt is forwarded to the file system, and nothing is
+        // replied.
+        let res = server.handle_message(reader, writer, None, None).unwrap();
+        assert_eq!(res, 0);
+        assert!(write_buf.iter().all(|&b| b == 0));
+        assert_eq!(*server.fs.0.lock().unwrap(), vec![(42, 1234)]);
+
+        // A truncated message is dropped without a reply.
+        let mut read_buf = Vec::new();
+        read_buf.extend_from_slice(in_header.as_slice());
+        let reader = Reader::<()>::from_slice(&mut read_buf);
+        let writer = TestWriter::new(&mut write_buf);
+        let res = server.handle_message(reader, writer, None, None).unwrap();
+        assert_eq!(res, 0);
+        assert!(write_buf.iter().all(|&b| b == 0));
+        assert_eq!(server.fs.0.lock().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn test_server_copy_file_range() {
+        use std::sync::Mutex;
+
+        #[derive(Default)]
+        struct CopyFs(Mutex<Vec<(u64, u64, u64, u64, u64, u64, u64, u64)>>);
+        impl FileSystem for CopyFs {
+            type Inode = u64;
+            type Handle = u64;
+
+            fn copy_file_range(
+                &self,
+                _ctx: &crate::api::filesystem::Context,
+                inode_in: u64,
+                handle_in: u64,
+                offset_in: u64,
+                inode_out: u64,
+                handle_out: u64,
+                offset_out: u64,
+                len: u64,
+                flags: u64,
+            ) -> io::Result<usize> {
+                self.0.lock().unwrap().push((
+                    inode_in, handle_in, offset_in, inode_out, handle_out, offset_out, len, flags,
+                ));
+                if inode_in == 0xbad {
+                    return Err(io::Error::from_raw_os_error(libc::EXDEV));
+                }
+                // Pretend the backend copied more than asked for.
+                Ok(len as usize + 1)
+            }
+        }
+
+        let copy = |server: &Server<CopyFs>, nodeid: u64, len: u64| {
+            let arg = CopyFileRangeIn {
+                fh_in: 1,
+                offset_in: 2,
+                nodeid_out: 3,
+                fh_out: 4,
+                offset_out: 5,
+                len,
+                flags: 6,
+            };
+            let mut read_buf = [0u8; size_of::<CopyFileRangeIn>()];
+            read_buf.copy_from_slice(arg.as_slice());
+            let mut write_buf = [0u8; 4096];
+            let ctx = {
+                let reader = Reader::<()>::from_slice(&mut read_buf);
+                let writer = TestWriter::new(&mut write_buf);
+                let in_header = InHeader {
+                    nodeid,
+                    ..Default::default()
+                };
+                SrvContext::new(in_header, reader, writer)
+            };
+            let res = server.copy_file_range(ctx).unwrap();
+            let mut hdr = OutHeader::default();
+            hdr.as_mut_slice()
+                .copy_from_slice(&write_buf[..size_of::<OutHeader>()]);
+            let mut out = WriteOut::default();
+            if hdr.error == 0 {
+                assert_eq!(res, size_of::<OutHeader>() + size_of::<WriteOut>());
+                out.as_mut_slice()
+                    .copy_from_slice(&write_buf[size_of::<OutHeader>()..res]);
+            }
+            (hdr.error, out.size)
+        };
+
+        let server = Server::new(CopyFs::default());
+        assert_eq!(copy(&server, 7, 8192), (0, 8192));
+        assert_eq!(
+            server.fs.0.lock().unwrap().pop().unwrap(),
+            (7, 1, 2, 3, 4, 5, 8192, 6)
+        );
+
+        // The length is capped so that the result fits into WriteOut::size.
+        assert_eq!(
+            copy(&server, 7, u64::MAX),
+            (0, COPY_FILE_RANGE_MAX_LEN as u32)
+        );
+        assert_eq!(
+            server.fs.0.lock().unwrap().pop().unwrap().6,
+            COPY_FILE_RANGE_MAX_LEN
+        );
+
+        // Errors are passed back to the kernel.
+        assert_eq!(copy(&server, 0xbad, 4096).0, -libc::EXDEV);
     }
 
     #[cfg(feature = "fusedev-uring")]

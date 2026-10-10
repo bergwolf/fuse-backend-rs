@@ -37,6 +37,15 @@ impl FileSystem for Vfs {
             if n_opts.no_writeback {
                 n_opts.out_opts.remove(FsOptions::WRITEBACK_CACHE);
             }
+            // The kernel ignores FUSE_PASSTHROUGH when the writeback cache is enabled too, so
+            // let the explicit (non-default) passthrough request win.
+            if n_opts.out_opts.contains(FsOptions::PASSTHROUGH)
+                && opts.contains(FsOptions::PASSTHROUGH)
+                && n_opts.out_opts.contains(FsOptions::WRITEBACK_CACHE)
+            {
+                info!("vfs: disable writeback cache, which conflicts with FUSE passthrough");
+                n_opts.out_opts.remove(FsOptions::WRITEBACK_CACHE);
+            }
             if !n_opts.killpriv_v2 {
                 n_opts.out_opts.remove(FsOptions::HANDLE_KILLPRIV_V2);
             }
@@ -69,6 +78,14 @@ impl FileSystem for Vfs {
             }
 
             self.initialized.store(false, Ordering::Release);
+        }
+    }
+
+    fn interrupt(&self, ctx: &Context, unique: u64) {
+        // The request may be served by any backend, the unknown ones ignore it.
+        let superblocks = self.superblocks.load();
+        for fs in superblocks.iter().flatten() {
+            fs.interrupt(ctx, unique);
         }
     }
 
@@ -432,6 +449,56 @@ impl FileSystem for Vfs {
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
+    fn copy_file_range(
+        &self,
+        ctx: &Context,
+        inode_in: VfsInode,
+        handle_in: u64,
+        offset_in: u64,
+        inode_out: VfsInode,
+        handle_out: u64,
+        offset_out: u64,
+        len: u64,
+        flags: u64,
+    ) -> Result<usize> {
+        let (root, idata_in) = self.get_real_rootfs(inode_in)?;
+        let (_, idata_out) = self.get_real_rootfs(inode_out)?;
+
+        // Files of different backends can't be copied by one of them, let the
+        // kernel fall back to the generic copy.
+        if idata_in.fs_idx() != idata_out.fs_idx() {
+            return Err(Error::from_raw_os_error(libc::EXDEV));
+        }
+
+        let res = match root {
+            // The pseudo filesystem only holds directories.
+            Left(_) => Err(Error::from_raw_os_error(libc::EOPNOTSUPP)),
+            Right(fs) => fs.copy_file_range(
+                ctx,
+                idata_in.ino(),
+                handle_in,
+                offset_in,
+                idata_out.ino(),
+                handle_out,
+                offset_out,
+                len,
+                flags,
+            ),
+        };
+        // ENOSYS makes the kernel disable copy_file_range for the whole
+        // mount, so do not let a backend without support turn it off for the
+        // other backends; EOPNOTSUPP falls back to the generic copy for this
+        // call only.
+        res.map_err(|e| {
+            if e.raw_os_error() == Some(libc::ENOSYS) {
+                Error::from_raw_os_error(libc::EOPNOTSUPP)
+            } else {
+                e
+            }
+        })
+    }
+
     fn release(
         &self,
         ctx: &Context,
@@ -721,6 +788,7 @@ mod tests {
             gid: 100123,
             pid: 1,
             supp_gid: None,
+            ..Default::default()
         };
 
         vfs.id_remap(&mut ctx).unwrap();
@@ -741,6 +809,7 @@ mod tests {
             gid: 100123,
             pid: 1,
             supp_gid: None,
+            ..Default::default()
         };
 
         // fs_idx == 0 (pseudo fs) falls back to global mapping
@@ -766,6 +835,7 @@ mod tests {
             gid: 100123,
             pid: 1,
             supp_gid: Some(100123),
+            ..Default::default()
         };
         vfs.remap_ctx_supp_gid(&mut ctx, 0);
         assert_eq!(ctx.supp_gid, Some(123));
@@ -777,6 +847,7 @@ mod tests {
             gid: 100123,
             pid: 1,
             supp_gid: Some(5),
+            ..Default::default()
         };
         vfs.remap_ctx_supp_gid(&mut ctx, 0);
         assert_eq!(ctx.supp_gid, None);
@@ -788,6 +859,7 @@ mod tests {
             gid: 0,
             pid: 1,
             supp_gid: Some(123),
+            ..Default::default()
         };
         vfs.remap_ctx_supp_gid(&mut ctx, 0);
         assert_eq!(ctx.supp_gid, Some(123));

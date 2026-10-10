@@ -24,23 +24,69 @@ Note that the async numbers include the runtime dispatch cost
 of delegation itself; they do not predict end-to-end throughput, because the
 fuse transport and request concurrency dominate there.
 
+### Request dispatch micro-benchmark
+
+`benches/dispatch_microbench.rs` measures the per-request framework
+overhead of the fusedev path: each iteration decodes a FUSE request from a
+buffer (`Reader::from_fuse_buffer()`), dispatches it through
+`Server::handle_message()` to a file system that does no work, and encodes
+the reply into an in-memory `Writer`, so no syscalls are involved. Before
+the criterion timings it prints the number of heap allocations per request,
+counted by a global allocator wrapper.
+
+Covered operations: `getattr`, `lookup`, `read` (4KB) and `write` (4KB),
+plus `read_4k_file` and `write_4k_file`, which transfer the data from/to a
+real (page cached) file through the same vectored file IO path as the fusedev
+transport, so that allocations in the syscall wrappers are counted too; their
+timings include the `pread`/`pwrite` syscall.
+
+```sh
+cd tests/benchmark
+cargo bench --bench dispatch_microbench
+```
+
 ## 2. End-to-end comparison with fio
 
 `tests/scripts/bench_sync_async.sh` mounts the `fuse-backend-rs-benchmark`
-daemon once per mode — sync mode (N worker threads, one fuse channel each),
+daemon once per mode — sync mode (N worker threads, each blocking on its own
+cloned fuse device fd, see `FuseSession::new_blocking_channel()`),
 async mode (N asynchronous workers through `AsyncFuseServing`, each with
 its own `/dev/fuse` file description and async runtime, tokio-uring when
 io_uring is available) and uring mode (the experimental
 FUSE-over-io_uring transport, requires kernel 6.14+ and is skipped
 otherwise) — and runs identical fio workloads:
 
-- sequential read/write with 1MB requests
+- sequential read/write with 1MB requests (`BS`)
 - random read/write with 4KB requests
 - metadata operations (file create/delete)
 
 ```sh
 sudo tests/scripts/bench_sync_async.sh      # needs fio + fuse mount rights
 THREADS=8 RUNTIME=60 sudo -E tests/scripts/bench_sync_async.sh
+```
+
+By default the daemon negotiates the kernel's 1MB maximum request size
+(`FUSE_MAX_PAGES` with 256 pages). `MAX_WRITE=<bytes>` passes
+`--max-write <bytes>` to the daemon, which raises the negotiated
+`max_write`/`max_pages` (`Server::set_max_write()`) and sizes the fuse
+device buffers accordingly (`FuseSession::set_bufsize()`); the script also
+raises `/proc/sys/fs/fuse/max_pages_limit`, which caps the request size on
+the kernel side. Combine it with a larger `BS` to measure large requests:
+
+```sh
+BS=16M MAX_WRITE=16777216 sudo -E tests/scripts/bench_sync_async.sh
+```
+
+`DAEMON_ARGS` appends extra arguments to the daemon command line. With
+`DAEMON_ARGS=--passthrough` the daemon enables kernel FUSE passthrough
+(`FUSE_PASSTHROUGH`, Linux 6.9+): `PassthroughFs` registers the backing
+file of each opened regular file with the kernel, which then serves reads
+and writes directly from it without sending them to the daemon (the async
+mode ignores the flag). Backing file registration needs `CAP_SYS_ADMIN`, so
+run the script as root:
+
+```sh
+MODES=sync DAEMON_ARGS=--passthrough sudo -E tests/scripts/bench_sync_async.sh
 ```
 
 The script builds the daemon in release mode; when invoking it with `sudo`,

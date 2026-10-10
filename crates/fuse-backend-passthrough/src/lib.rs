@@ -15,6 +15,7 @@
 extern crate log;
 
 use std::any::Any;
+use std::cell::RefCell;
 use std::collections::{btree_map, BTreeMap, HashMap};
 use std::ffi::{CStr, CString, OsString};
 use std::fs::File;
@@ -26,7 +27,7 @@ use std::os::unix::ffi::OsStringExt;
 use std::os::unix::io::{AsRawFd, RawFd};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, RwLock, RwLockWriteGuard};
+use std::sync::{Arc, Mutex, RwLock, RwLockWriteGuard, Weak};
 use std::time::Duration;
 
 use vm_memory::{bitmap::BitmapSlice, ByteValued};
@@ -42,7 +43,7 @@ use self::util::{
 };
 use fuse_backend_core::abi::fuse_abi as fuse;
 use fuse_backend_core::abi::fuse_abi::Opcode;
-use fuse_backend_core::api::filesystem::Entry;
+use fuse_backend_core::api::filesystem::{BackingFileRegistry, Entry};
 use fuse_backend_core::api::{
     validate_path_component, BackendFileSystem, CURRENT_DIR_CSTR, EMPTY_CSTR, PARENT_DIR_CSTR,
     PROC_SELF_FD_CSTR, SLASH_ASCII, VFS_MAX_INO,
@@ -151,6 +152,19 @@ pub struct InodeData {
     refcount: AtomicU64,
     // File type and mode
     mode: u32,
+    // Kernel FUSE passthrough backing file, see `Config::fuse_passthrough`.
+    backing: Mutex<BackingFile>,
+}
+
+/// Kernel FUSE passthrough backing file of an inode.
+///
+/// The kernel requires all concurrent passthrough opens of an inode to use the same backing
+/// file, so the backing file is registered by the first open and shared, refcounted by the open
+/// handles, until the last one is released.
+#[derive(Debug, Default)]
+struct BackingFile {
+    id: u32,
+    users: u32,
 }
 
 impl InodeData {
@@ -161,6 +175,7 @@ impl InodeData {
             id,
             refcount: AtomicU64::new(refcount),
             mode,
+            backing: Mutex::new(BackingFile::default()),
         }
     }
 
@@ -261,6 +276,11 @@ struct HandleData {
     inode: Inode,
     file: File,
     open_flags: RwLock<u32>,
+    // Inode whose passthrough backing file is used by this handle.
+    backing: Option<Arc<InodeData>>,
+    // Whether the handle has been removed from its `HandleMap`, so that the
+    // per-thread handle cache doesn't hand it out anymore.
+    released: AtomicBool,
 }
 
 impl HandleData {
@@ -269,6 +289,8 @@ impl HandleData {
             inode,
             file,
             open_flags: RwLock::new(flags),
+            backing: None,
+            released: AtomicBool::new(false),
         }
     }
 
@@ -286,7 +308,45 @@ impl HandleData {
     }
 }
 
+/// Number of entries of the per-thread handle cache, see [`HANDLE_CACHE`].
+const HANDLE_CACHE_ENTRIES: usize = 8;
+
+/// Source of the unique ids of [`HandleMap`]s, which key the per-thread
+/// handle cache.
+static NEXT_HANDLE_MAP_ID: AtomicU64 = AtomicU64::new(1);
+
+struct HandleCacheEntry {
+    // Id of the `HandleMap` the handle belongs to, 0 for an empty entry.
+    map: u64,
+    handle: Handle,
+    data: Weak<HandleData>,
+}
+
+const EMPTY_HANDLE_CACHE_ENTRY: HandleCacheEntry = HandleCacheEntry {
+    map: 0,
+    handle: 0,
+    data: Weak::new(),
+};
+
+thread_local! {
+    /// Per-thread, direct mapped cache of [`HandleMap`] lookups.
+    ///
+    /// Looking up a handle in the map takes the read side of the map lock, an
+    /// atomic read-modify-write of a cache line shared by all the threads
+    /// serving requests, which is expensive when the threads run on different
+    /// CPUs. Hits in this cache only touch the handle itself.
+    ///
+    /// Entries hold weak references, so they don't keep the files of released
+    /// handles open. Handles are never reused within a map, and maps are
+    /// identified by a unique id rather than by their address, so a stale
+    /// entry can't alias a newer handle.
+    static HANDLE_CACHE: RefCell<[HandleCacheEntry; HANDLE_CACHE_ENTRIES]> =
+        const { RefCell::new([EMPTY_HANDLE_CACHE_ENTRY; HANDLE_CACHE_ENTRIES]) };
+}
+
 struct HandleMap {
+    // Unique id of the map, see `HANDLE_CACHE`.
+    id: u64,
     handles: RwLock<BTreeMap<Handle, Arc<HandleData>>>,
     /// Sidecar cache of directory cookies, kept out of `HandleData` so that
     /// ordinary (non-directory) handles don't pay for it.
@@ -309,6 +369,7 @@ struct HandleMap {
 impl HandleMap {
     fn new() -> Self {
         HandleMap {
+            id: NEXT_HANDLE_MAP_ID.fetch_add(1, Ordering::Relaxed),
             handles: RwLock::new(BTreeMap::new()),
             cookies: Mutex::new(HashMap::new()),
         }
@@ -316,7 +377,12 @@ impl HandleMap {
 
     fn clear(&self) {
         // Do not expect poisoned lock here, so safe to unwrap().
-        self.handles.write().unwrap().clear();
+        let mut handles = self.handles.write().unwrap();
+        for data in handles.values() {
+            data.released.store(true, Ordering::Release);
+        }
+        handles.clear();
+        drop(handles);
         self.cookies.lock().unwrap().clear();
     }
 
@@ -325,16 +391,16 @@ impl HandleMap {
         self.handles.write().unwrap().insert(handle, Arc::new(data));
     }
 
-    fn release(&self, handle: Handle, inode: Inode) -> io::Result<()> {
+    fn release(&self, handle: Handle, inode: Inode) -> io::Result<Arc<HandleData>> {
         // Do not expect poisoned lock here, so safe to unwrap().
         let mut handles = self.handles.write().unwrap();
 
         if let btree_map::Entry::Occupied(e) = handles.entry(handle) {
             if e.get().inode == inode {
+                e.get().released.store(true, Ordering::Release);
                 // We don't need to close the file here because that will happen automatically when
                 // the last `Arc` is dropped.
-                e.remove();
-                return Ok(());
+                return Ok(e.remove());
             }
         }
 
@@ -342,14 +408,41 @@ impl HandleMap {
     }
 
     fn get(&self, handle: Handle, inode: Inode) -> io::Result<Arc<HandleData>> {
+        let slot = handle as usize % HANDLE_CACHE_ENTRIES;
+        let cached = HANDLE_CACHE
+            .try_with(|cache| {
+                let entry = &cache.borrow()[slot];
+                if entry.map == self.id && entry.handle == handle {
+                    entry.data.upgrade()
+                } else {
+                    None
+                }
+            })
+            .ok()
+            .flatten();
+        if let Some(hd) = cached {
+            if hd.inode == inode && !hd.released.load(Ordering::Acquire) {
+                return Ok(hd);
+            }
+        }
+
         // Do not expect poisoned lock here, so safe to unwrap().
-        self.handles
+        let hd = self
+            .handles
             .read()
             .unwrap()
             .get(&handle)
             .filter(|hd| hd.inode == inode)
             .cloned()
-            .ok_or_else(ebadf)
+            .ok_or_else(ebadf)?;
+        let _ = HANDLE_CACHE.try_with(|cache| {
+            cache.borrow_mut()[slot] = HandleCacheEntry {
+                map: self.id,
+                handle,
+                data: Arc::downgrade(&hd),
+            };
+        });
+        Ok(hd)
     }
 
     fn set_cookie(&self, handle: Handle, cookie: u64) {
@@ -426,6 +519,10 @@ pub struct PassthroughFs<S: BitmapSlice + Send + Sync = ()> {
     // `upgrade()` always fails for those.
     #[cfg(feature = "async-io")]
     shared_ref: std::sync::Weak<PassthroughFs<S>>,
+    // Whether kernel FUSE passthrough is negotiated and usable, see `Config::fuse_passthrough`.
+    passthrough: AtomicBool,
+    // Registry of passthrough backing files, see `set_backing_registry()`.
+    backing_registry: RwLock<Option<Arc<dyn BackingFileRegistry>>>,
 
     dir_entry_timeout: Duration,
     dir_attr_timeout: Duration,
@@ -447,6 +544,14 @@ impl<S: BitmapSlice + Send + Sync> PassthroughFs<S> {
                 "passthroughfs: writeback cache conflicts with cache=none, reset to no_writeback"
             );
             cfg.writeback = false;
+        }
+        if cfg.fuse_passthrough && cfg.writeback {
+            warn!("passthroughfs: writeback cache conflicts with FUSE passthrough, reset to no_writeback");
+            cfg.writeback = false;
+        }
+        if cfg.fuse_passthrough && cfg.seal_size {
+            warn!("passthroughfs: FUSE passthrough bypasses seal_size, disable FUSE passthrough");
+            cfg.fuse_passthrough = false;
         }
 
         // Safe because this is a constant value and a valid C string.
@@ -490,6 +595,8 @@ impl<S: BitmapSlice + Send + Sync> PassthroughFs<S> {
             async_thread_pool_enabled: AtomicBool::new(false),
             #[cfg(feature = "async-io")]
             shared_ref: std::sync::Weak::new(),
+            passthrough: AtomicBool::new(false),
+            backing_registry: RwLock::new(None),
             dir_entry_timeout,
             dir_attr_timeout,
             cfg,
@@ -529,6 +636,77 @@ impl<S: BitmapSlice + Send + Sync> PassthroughFs<S> {
         )));
 
         Ok(())
+    }
+
+    /// Set the registry used to register kernel FUSE passthrough backing files, see
+    /// `Config::fuse_passthrough`.
+    ///
+    /// For fusedev, use the registry of the session (`FuseSession::backing_registry()`), which
+    /// may be set up before the session is mounted.
+    pub fn set_backing_registry(&self, registry: Arc<dyn BackingFileRegistry>) {
+        *self.backing_registry.write().unwrap() = Some(registry);
+    }
+
+    /// Get the passthrough backing file id of an inode for a new open file, registering `file`
+    /// as the backing file if the inode has no open passthrough file yet.
+    ///
+    /// Returns `None` if the open shouldn't use passthrough.
+    fn get_backing(&self, data: &InodeData, file: &File) -> Option<u32> {
+        if !self.cfg.fuse_passthrough || data.mode & libc::S_IFMT != libc::S_IFREG {
+            return None;
+        }
+
+        // Do not expect poisoned lock here, so safe to unwrap().
+        let mut backing = data.backing.lock().unwrap();
+        // Once an inode has an open passthrough file, the kernel requires all its other open
+        // files to use the same backing file.
+        if backing.users == 0 {
+            if !self.passthrough.load(Ordering::Relaxed) {
+                return None;
+            }
+            let registry = self.backing_registry.read().unwrap().clone()?;
+            match registry.open_backing(file.as_fd()) {
+                Ok(id) => backing.id = id,
+                Err(e) => {
+                    match e.raw_os_error() {
+                        // No CAP_SYS_ADMIN, or no kernel support.
+                        Some(libc::EPERM)
+                        | Some(libc::ENOTTY)
+                        | Some(libc::EOPNOTSUPP)
+                        | Some(libc::ENOTCONN) => {
+                            warn!("passthroughfs: disable FUSE passthrough, failed to register backing file: {}", e);
+                            self.passthrough.store(false, Ordering::Relaxed);
+                        }
+                        _ => warn!(
+                            "passthroughfs: failed to register backing file of inode {}: {}",
+                            data.inode, e
+                        ),
+                    }
+                    return None;
+                }
+            }
+        }
+        backing.users += 1;
+        Some(backing.id)
+    }
+
+    /// Release the reference to the passthrough backing file of an inode taken by
+    /// `get_backing()`, unregistering it when it's the last one.
+    fn put_backing(&self, data: &InodeData) {
+        // Do not expect poisoned lock here, so safe to unwrap().
+        let mut backing = data.backing.lock().unwrap();
+        backing.users -= 1;
+        if backing.users == 0 {
+            let id = std::mem::take(&mut backing.id);
+            if let Some(registry) = self.backing_registry.read().unwrap().as_ref() {
+                if let Err(e) = registry.close_backing(id) {
+                    warn!(
+                        "passthroughfs: failed to unregister backing file {} of inode {}: {}",
+                        id, data.inode, e
+                    );
+                }
+            }
+        }
     }
 
     /// Get the list of file descriptors which should be reserved across live upgrade.
@@ -784,10 +962,20 @@ impl<S: BitmapSlice + Send + Sync> PassthroughFs<S> {
         })
     }
 
-    fn forget_one(&self, inodes: &mut InodeStore, inode: Inode, count: u64) {
+    /// Drop `count` references to `inode`, returning its data if that was the last reference.
+    ///
+    /// The returned data holds the file of the inode, which callers should drop after releasing
+    /// the lock of `inodes`: closing the last reference to an unlinked file evicts it, which is
+    /// expensive and would stall the requests waiting for the lock.
+    fn forget_one(
+        &self,
+        inodes: &mut InodeStore,
+        inode: Inode,
+        count: u64,
+    ) -> Option<Arc<InodeData>> {
         // ROOT_ID should not be forgotten, or we're not able to access to files any more.
         if inode == fuse::ROOT_ID {
-            return;
+            return None;
         }
 
         if let Some(data) = inodes.get(&inode) {
@@ -813,12 +1001,13 @@ impl<S: BitmapSlice + Send + Sync> PassthroughFs<S> {
                         // The allocated inode number should be kept in the map when use_host_ino
                         // is false or host inode(don't use the virtual 56bit inode) is bigger than MAX_HOST_INO.
                         let keep_mapping = !self.cfg.use_host_ino || data.id.ino > MAX_HOST_INO;
-                        inodes.remove(&inode, keep_mapping);
+                        return inodes.remove(&inode, keep_mapping);
                     }
                     break;
                 }
             }
         }
+        None
     }
 
     fn do_release(&self, inode: Inode, handle: Handle) -> io::Result<()> {
@@ -827,8 +1016,11 @@ impl<S: BitmapSlice + Send + Sync> PassthroughFs<S> {
         // `HandleMap::clear()`.  If `release()` fails the cached cookie (if
         // any) is left behind; that is harmless and it will be dropped by
         // `destroy()`.
-        self.handle_map.release(handle, inode)?;
+        let data = self.handle_map.release(handle, inode)?;
         self.handle_map.remove_cookie(handle);
+        if let Some(inode_data) = data.backing.as_ref() {
+            self.put_backing(inode_data);
+        }
         Ok(())
     }
 
@@ -1786,6 +1978,7 @@ mod tests {
             gid: uid,
             pid: 1,
             supp_gid: Some(100000 + gid),
+            ..Default::default()
         };
         let parent = vfs
             .lookup(

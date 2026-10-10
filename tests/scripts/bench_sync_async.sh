@@ -35,6 +35,14 @@
 #            pipeline to benchmark different code variants with an
 #            identical workload definition
 #   RESULTS_DIR where to store results (default a fresh mktemp directory)
+#   BS       block size of the sequential workloads (default 1M)
+#   MAX_WRITE  if set, passed to the daemon as --max-write (bytes) to raise
+#            the INIT max_write/max_pages and the session buffers; the
+#            script also raises /proc/sys/fs/fuse/max_pages_limit (best
+#            effort, needs root) since the kernel caps requests to it
+#   DAEMON_ARGS  extra arguments appended to the daemon command line, e.g.
+#            "--passthrough" for kernel FUSE passthrough (ignored by the
+#            async mode, needs root)
 
 set -euo pipefail
 
@@ -50,6 +58,9 @@ SIZE=${SIZE:-256M}
 RUNTIME=${RUNTIME:-30}
 NRFILES=${NRFILES:-50000}
 MODES=${MODES:-"sync async"}
+BS=${BS:-1M}
+MAX_WRITE=${MAX_WRITE:-}
+DAEMON_ARGS=${DAEMON_ARGS:-}
 RESULTS_DIR=${RESULTS_DIR:-$(mktemp -d /tmp/fuse-bench-results.XXXXXX)}
 SRC_DIR="${RESULTS_DIR}/source"
 MNT_DIR="${RESULTS_DIR}/mount"
@@ -88,6 +99,16 @@ fi
 
 echo "results directory: ${RESULTS_DIR}"
 
+# The kernel caps the pages per request to max_pages_limit (256 pages by
+# default), so a larger max_write needs the limit raised as well.
+if [ -n "${MAX_WRITE}" ] && [ -w /proc/sys/fs/fuse/max_pages_limit ]; then
+    pages=$(( (MAX_WRITE + $(getconf PAGESIZE) - 1) / $(getconf PAGESIZE) ))
+    if [ "$(cat /proc/sys/fs/fuse/max_pages_limit)" -lt "${pages}" ]; then
+        echo "${pages}" > /proc/sys/fs/fuse/max_pages_limit ||
+            echo "warning: could not raise fs.fuse.max_pages_limit" >&2
+    fi
+fi
+
 # Build the benchmark daemon in release mode, unless the caller provided
 # a prebuilt one via $DAEMON (e.g. the CI pipeline benchmarking several
 # code variants with this very script).
@@ -112,7 +133,8 @@ trap cleanup EXIT
 start_daemon() {
     local mode_args=$1
     # shellcheck disable=SC2086
-    "${DAEMON}" "${SRC_DIR}" "${MNT_DIR}" ${mode_args} --threads "${THREADS}" &
+    "${DAEMON}" "${SRC_DIR}" "${MNT_DIR}" ${mode_args} --threads "${THREADS}" \
+        ${MAX_WRITE:+--max-write "${MAX_WRITE}"} ${DAEMON_ARGS} &
     DAEMON_PID=$!
     for _ in $(seq 50); do
         # A daemon that mounted and immediately died (rejected session)
@@ -223,9 +245,9 @@ for mode in ${MODES}; do
     # Sequential IO with large requests (throughput oriented). ramp_time
     # excludes cold-start effects (first touches, daemon caches warming up)
     # from the measurement.
-    run_workload "${mode}" seqwrite --rw=write --bs=1M --size="${SIZE}" \
+    run_workload "${mode}" seqwrite --rw=write --bs="${BS}" --size="${SIZE}" \
         --numjobs="${THREADS}" --ioengine=psync --ramp_time=2
-    run_workload "${mode}" seqread --rw=read --bs=1M --size="${SIZE}" \
+    run_workload "${mode}" seqread --rw=read --bs="${BS}" --size="${SIZE}" \
         --numjobs="${THREADS}" --ioengine=psync --ramp_time=2
 
     # Random IO with small requests (latency/metadata oriented).

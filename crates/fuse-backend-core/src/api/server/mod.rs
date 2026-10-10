@@ -20,7 +20,7 @@ use std::ffi::CStr;
 use std::io::{self, Read};
 use std::marker::PhantomData;
 use std::mem::size_of;
-use std::sync::atomic::AtomicU64;
+use std::sync::atomic::{AtomicU32, AtomicU64};
 
 use crate::abi::fuse_abi::*;
 use crate::api::filesystem::{Context, FileSystem, ZeroCopyReader, ZeroCopyWriter};
@@ -52,12 +52,24 @@ const DIRENT_PADDING: [u8; 8] = [0; 8];
 /// Maximum number of pages required for FUSE requests.
 pub const MAX_REQ_PAGES: u16 = 256; // 1MB
 
+/// Default passthrough backing file stacking depth, see `Server::set_max_stack_depth()`.
+#[cfg(target_os = "linux")]
+pub const DEFAULT_MAX_STACK_DEPTH: u32 = 1;
+// FILESYSTEM_MAX_STACK_DEPTH of the kernel.
+#[cfg(target_os = "linux")]
+const MAX_STACK_DEPTH: u32 = 2;
+
 /// Fuse Server to handle requests from the Fuse client and vhost user master.
 pub struct Server<F: FileSystem + Sync> {
     fs: F,
     vers: AtomicU64,
     // Options negotiated with the kernel through INIT, see `init()`.
     options: AtomicU64,
+    // FUSE_WRITE payload limit requested through `set_max_write()`, 0 for the default.
+    max_write: AtomicU32,
+    // Passthrough backing file stacking depth, see `set_max_stack_depth()`.
+    #[cfg(target_os = "linux")]
+    max_stack_depth: AtomicU32,
     /// Extra capability flags to advertise in the INIT reply, requested
     /// through `set_uring()` (experimental fusedev-uring transport).
     #[cfg(all(target_os = "linux", feature = "fusedev-uring"))]
@@ -74,11 +86,72 @@ impl<F: FileSystem + Sync> Server<F> {
             fs,
             vers: AtomicU64::new(encode_version(KERNEL_VERSION, KERNEL_MINOR_VERSION)),
             options: AtomicU64::new(0),
+            max_write: AtomicU32::new(0),
+            #[cfg(target_os = "linux")]
+            max_stack_depth: AtomicU32::new(DEFAULT_MAX_STACK_DEPTH),
             #[cfg(all(target_os = "linux", feature = "fusedev-uring"))]
             extra_init_flags: AtomicU64::new(0),
             #[cfg(all(target_os = "linux", feature = "fusedev-uring"))]
             negotiated_init_flags: AtomicU64::new(0),
         }
+    }
+
+    /// Set the maximum payload of FUSE_WRITE requests to advertise in the INIT reply.
+    ///
+    /// The value is rounded up to a multiple of the page size and capped at `u16::MAX` pages,
+    /// and it is advertised through `max_write` and, when the kernel supports `FUSE_MAX_PAGES`,
+    /// `max_pages`. Passing 0 restores the default of `MAX_REQ_PAGES` pages (1MB with 4K
+    /// pages). Must be called before the INIT exchange to take effect.
+    ///
+    /// Requests up to the configured size (plus headers) are accepted from then on, so the
+    /// transport must be able to receive them: for fusedev, the session buffer (see
+    /// `FuseSession::set_bufsize()`) must be at least `max_write` plus the 4K header area, or
+    /// the kernel rejects reads from the fuse device with `EINVAL`. Note that the kernel caps
+    /// `max_pages` to `/proc/sys/fs/fuse/max_pages_limit` (256 pages by default), so larger
+    /// writes also need that limit raised.
+    pub fn set_max_write(&self, max_write: u32) {
+        let pagesize = crate::buffer::pagesize() as u64;
+        let max_write = if max_write == 0 {
+            0
+        } else {
+            let pages = std::cmp::min((max_write as u64).div_ceil(pagesize), u16::MAX as u64);
+            (pages * pagesize) as u32
+        };
+        self.max_write
+            .store(max_write, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// Set the maximum filesystem stacking depth of FUSE passthrough backing files, advertised
+    /// in the INIT reply when `FsOptions::PASSTHROUGH` is negotiated.
+    ///
+    /// With the default of 1, backing files must live on a non-stacked filesystem (ext4, xfs,
+    /// tmpfs, ...) and the FUSE mount itself may be used as a layer of a stacked filesystem such
+    /// as overlayfs; 2 allows backing files on a stacked filesystem, but then the FUSE mount
+    /// can't be stacked. The kernel only enables passthrough for values in `1..=2`, so other
+    /// values are clamped to that range. Must be called before the INIT exchange to take effect.
+    #[cfg(target_os = "linux")]
+    pub fn set_max_stack_depth(&self, depth: u32) {
+        self.max_stack_depth.store(
+            depth.clamp(1, MAX_STACK_DEPTH),
+            std::sync::atomic::Ordering::Relaxed,
+        );
+    }
+
+    /// Number of pages per request advertised in the INIT reply, see `set_max_write()`.
+    fn max_req_pages(&self) -> u16 {
+        match self.max_write.load(std::sync::atomic::Ordering::Relaxed) {
+            0 => MAX_REQ_PAGES,
+            v => (v as usize / crate::buffer::pagesize()) as u16,
+        }
+    }
+
+    /// Largest request payload accepted from the transport: `MAX_BUFFER_SIZE`, or the size
+    /// configured through `set_max_write()` if that is larger.
+    fn max_buffer_size(&self) -> u32 {
+        std::cmp::max(
+            MAX_BUFFER_SIZE,
+            self.max_write.load(std::sync::atomic::Ordering::Relaxed),
+        )
     }
 
     /// Request serving FUSE requests over io_uring (experimental).
@@ -213,6 +286,50 @@ fn decode_version(v: u64) -> ServerVersion {
     }
 }
 
+/// Bodies up to this size are kept on the stack by [`MessageBody`]. It holds a
+/// NUL-terminated `NAME_MAX` name, or two of them for RENAME.
+const MESSAGE_BODY_INLINE_SIZE: usize = 512;
+
+/// A request body copied out of the transport buffer.
+///
+/// Small bodies (file names) are stored inline so name-carrying requests such
+/// as LOOKUP don't allocate; larger ones fall back to the heap. The body is
+/// always copied, so a peer sharing the buffer (e.g. a virtio-fs guest) can't
+/// change it after it has been validated.
+// The inline variant is large on purpose: it only lives on the stack and
+// boxing it would bring back the heap allocation this type avoids.
+#[allow(clippy::large_enum_variant)]
+enum MessageBody {
+    Inline {
+        buf: [u8; MESSAGE_BODY_INLINE_SIZE],
+        len: usize,
+    },
+    Heap(Vec<u8>),
+}
+
+impl std::ops::Deref for MessageBody {
+    type Target = [u8];
+
+    fn deref(&self) -> &[u8] {
+        match self {
+            MessageBody::Inline { buf, len } => &buf[..*len],
+            MessageBody::Heap(buf) => buf,
+        }
+    }
+}
+
+impl AsRef<[u8]> for MessageBody {
+    fn as_ref(&self) -> &[u8] {
+        self
+    }
+}
+
+impl std::fmt::Debug for MessageBody {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        std::fmt::Debug::fmt(&**self, f)
+    }
+}
+
 struct ServerUtil();
 
 impl ServerUtil {
@@ -220,11 +337,18 @@ impl ServerUtil {
         r: &mut Reader<'_, S>,
         in_header: &InHeader,
         sub_hdr_sz: usize,
-    ) -> Result<Vec<u8>> {
+    ) -> Result<MessageBody> {
         let len = (in_header.len as usize)
             .checked_sub(size_of::<InHeader>())
             .and_then(|l| l.checked_sub(sub_hdr_sz))
             .ok_or(Error::InvalidHeaderLength)?;
+
+        if len <= MESSAGE_BODY_INLINE_SIZE {
+            let mut buf = [0u8; MESSAGE_BODY_INLINE_SIZE];
+            r.read_exact(&mut buf[..len])
+                .map_err(Error::DecodeMessage)?;
+            return Ok(MessageBody::Inline { buf, len });
+        }
 
         // Allocate buffer without zeroing out the content for performance.
         let mut buf = Vec::<u8>::with_capacity(len);
@@ -235,7 +359,7 @@ impl ServerUtil {
         };
         r.read_exact(&mut buf).map_err(Error::DecodeMessage)?;
 
-        Ok(buf)
+        Ok(MessageBody::Heap(buf))
     }
 
     fn extract_two_cstrs(buf: &[u8]) -> Result<(&CStr, &CStr)> {
@@ -393,5 +517,52 @@ mod tests {
         };
         // shoutld fail because of invalid sub header size
         assert!(ServerUtil::get_message_body(&mut r, &in_header, 0x1001).is_err());
+    }
+
+    #[test]
+    fn test_get_message_body_inline() {
+        let hdr = size_of::<InHeader>();
+        let mut read_buf = [0u8; 4096];
+        read_buf[..8].copy_from_slice(b"name\0foo");
+
+        let mut r = Reader::<()>::from_slice(&mut read_buf);
+        let in_header = InHeader {
+            len: (hdr + 5) as u32,
+            ..Default::default()
+        };
+        let buf = ServerUtil::get_message_body(&mut r, &in_header, 0).unwrap();
+        assert!(matches!(buf, MessageBody::Inline { .. }));
+        assert_eq!(&*buf, b"name\0");
+        assert_eq!(r.bytes_read(), 5);
+
+        // Largest inline body.
+        let mut r = Reader::<()>::from_slice(&mut read_buf);
+        let in_header = InHeader {
+            len: (hdr + MESSAGE_BODY_INLINE_SIZE) as u32,
+            ..Default::default()
+        };
+        let buf = ServerUtil::get_message_body(&mut r, &in_header, 0).unwrap();
+        assert!(matches!(buf, MessageBody::Inline { .. }));
+        assert_eq!(buf.len(), MESSAGE_BODY_INLINE_SIZE);
+        assert_eq!(&buf[..5], b"name\0");
+
+        // One more byte goes to the heap.
+        let mut r = Reader::<()>::from_slice(&mut read_buf);
+        let in_header = InHeader {
+            len: (hdr + MESSAGE_BODY_INLINE_SIZE + 1) as u32,
+            ..Default::default()
+        };
+        let buf = ServerUtil::get_message_body(&mut r, &in_header, 0).unwrap();
+        assert!(matches!(buf, MessageBody::Heap(_)));
+        assert_eq!(buf.len(), MESSAGE_BODY_INLINE_SIZE + 1);
+
+        // Short reader fails on the inline path too.
+        let mut short = [0u8; 4];
+        let mut r = Reader::<()>::from_slice(&mut short);
+        let in_header = InHeader {
+            len: (hdr + 5) as u32,
+            ..Default::default()
+        };
+        assert!(ServerUtil::get_message_body(&mut r, &in_header, 0).is_err());
     }
 }

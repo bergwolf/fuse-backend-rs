@@ -13,6 +13,38 @@
   between the facade and `fuse-backend-core` and carries the `arc-swap` and
   `persist` (`versionize`/`dbs-snapshot`) stack that the multiplexer needs.
 - [188](https://github.com/cloud-hypervisor/fuse-backend-rs/issues/188): docs: document the experimental status of async-io support.
+- [3](https://github.com/bergwolf/fuse-backend-rs/pull/3): Forward `FUSE_COPY_FILE_RANGE` through the new
+  `FileSystem::copy_file_range()` (default `ENOSYS`); `Vfs` routes it to the
+  backing file system (`EXDEV` across mounts) and `PassthroughFs` implements
+  it with `copy_file_range(2)`, so `cp` inside a mount no longer copies the
+  data through the daemon.
+- [3](https://github.com/bergwolf/fuse-backend-rs/pull/3): `Server::set_max_write()` raises the negotiated
+  `max_write`/`max_pages` beyond the 1MB default, and
+  `FuseSession::set_bufsize()` sizes the fuse device buffers to match. The
+  benchmark daemon exposes them as `--max-write`, and
+  `tests/scripts/bench_sync_async.sh` gains the `BS` and `MAX_WRITE` tunables.
+- [3](https://github.com/bergwolf/fuse-backend-rs/pull/3): Forward `FUSE_INTERRUPT` to the new `FileSystem::interrupt()`
+  (default no-op; `Vfs` forwards it to every mounted file system), and add
+  `Context::unique` so that file systems can match an interrupt with the
+  request it targets.
+- [3](https://github.com/bergwolf/fuse-backend-rs/pull/3): Kernel FUSE passthrough (`FUSE_PASSTHROUGH`, Linux 6.9+). With
+  `passthrough::Config::fuse_passthrough` set and a backing registry from
+  `FuseSession::backing_registry()` installed via
+  `PassthroughFs::set_backing_registry()`, `PassthroughFs` registers the
+  backing file of each opened regular file with the kernel
+  (`FUSE_DEV_IOC_BACKING_OPEN`, one id per inode shared by its handles), and
+  the kernel serves reads, writes and mmap directly from it. New ABI/API
+  pieces: `FsOptions::PASSTHROUGH`, `OpenOptions::PASSTHROUGH`,
+  `FuseBackingMap`, the `BackingFileRegistry` trait and
+  `Server::set_max_stack_depth()`. Passthrough excludes the writeback cache
+  (`Vfs` drops `WRITEBACK_CACHE` when it negotiates passthrough), needs
+  `CAP_SYS_ADMIN`, is only used by the synchronous server, and turns itself
+  off for the session when the kernel refuses to register a backing file.
+  The benchmark daemon exposes it as `--passthrough`, and
+  `tests/scripts/bench_sync_async.sh` gains the `DAEMON_ARGS` tunable.
+- [3](https://github.com/bergwolf/fuse-backend-rs/pull/3): `tests/benchmark/benches/dispatch_microbench.rs` measures the
+  per-request decode/dispatch/encode overhead of the fusedev path and the
+  heap allocations per request.
 
 ### Changed
 - [254](https://github.com/cloud-hypervisor/fuse-backend-rs/pull/254): `fuse-backend-rs` is now a thin facade re-exporting the sub-crates. Every
@@ -49,6 +81,35 @@
 - [#221](https://github.com/cloud-hypervisor/fuse-backend-rs/pull/221): `FuseDevWriter` no longer derives `PartialEq`/`Eq`; comparing two
   writers for equality was never meaningful (they wrap a mutable reply buffer)
   and no code in the workspace relied on it.
+
+- [3](https://github.com/bergwolf/fuse-backend-rs/pull/3): `Context` gains the public `unique` field; code that builds a
+  `Context` with a struct literal must add it (or use `..Default::default()`).
+- [3](https://github.com/bergwolf/fuse-backend-rs/pull/3): `InitOut` gains the `max_stack_depth` field, carved out of
+  `unused` (now `[u32; 6]`, the struct size is unchanged); code that builds
+  an `InitOut` with a struct literal must adapt.
+- [3](https://github.com/bergwolf/fuse-backend-rs/pull/3): Serving a request from a contiguous buffer (the `/dev/fuse`
+  path) no longer allocates: `IoBuffers` keeps its first buffer inline
+  (new `IoBuffers::from_slice()`), reads within one buffer pass a single
+  slice on the stack instead of collecting a `Vec`, and request bodies of up
+  to 512 bytes (file names) are copied to the stack. The dispatch
+  micro-benchmark goes from 3-4 heap allocations to none per request and is
+  22-45% faster.
+- [3](https://github.com/bergwolf/fuse-backend-rs/pull/3): `File`'s vectored volatile IO (`read_vectored_volatile()`,
+  `read_vectored_at_volatile()` and their write counterparts) uses the plain
+  `read`/`write`/`pread64`/`pwrite64` syscall for a single buffer, always the
+  case on the fusedev path, instead of collecting an iovec `Vec` for
+  `readv`/`preadv`, which saves a heap allocation per read/write request. The
+  dispatch micro-benchmark gains file-backed `read_4k_file`/`write_4k_file`
+  cases to cover that path.
+- [3](https://github.com/bergwolf/fuse-backend-rs/pull/3): The benchmark daemon serves the sync mode from
+  `FuseSession::new_blocking_channel()`, saving the `epoll_wait` syscall per
+  request of `new_channel()`.
+- [3](https://github.com/bergwolf/fuse-backend-rs/pull/3): `PassthroughFs::setattr()` without a file handle updates
+  atime/mtime with `utimensat(fd, "", AT_EMPTY_PATH)` on the inode's `O_PATH`
+  fd instead of resolving `/proc/self/fd/N`, which instantiated a procfs
+  dentry and inode per file for the time flushes the kernel sends with
+  writeback cache (e.g. ahead of every unlink). Kernels older than 5.8 fall
+  back to the `/proc/self/fd` path.
 
 ### Removed
 - [254](https://github.com/cloud-hypervisor/fuse-backend-rs/pull/254): Drop the vestigial `vhost` and `virtio-bindings` dependencies that the

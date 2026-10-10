@@ -30,10 +30,10 @@ pub use fuse_backend_fusedev as fusedev;
 #[cfg(feature = "virtiofs")]
 pub use fuse_backend_virtiofs as virtiofs;
 
-#[cfg(all(target_os = "linux", feature = "fusedev"))]
-pub use self::fusedev::BlockingFuseChannel;
 #[cfg(all(target_os = "linux", feature = "fusedev", feature = "async-io"))]
 pub use self::fusedev::{AsyncFuseServing, AsyncServingConfig, FuseDevTask};
+#[cfg(all(target_os = "linux", feature = "fusedev"))]
+pub use self::fusedev::{BlockingFuseChannel, FuseBackingRegistry};
 #[cfg(feature = "fusedev")]
 pub use self::fusedev::{
     FuseBuf, FuseChannel, FuseChannelExt, FuseDevReaderExt, FuseDevWriter, FuseSession,

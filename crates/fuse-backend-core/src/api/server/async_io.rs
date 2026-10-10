@@ -23,7 +23,6 @@ use crate::api::filesystem::{
 };
 use crate::api::server::{
     decode_version, InitParams, MetricsHook, Server, ServerUtil, SrvContext, BUFFER_HEADER_SIZE,
-    MAX_BUFFER_SIZE,
 };
 use crate::buffer::{Reader, Writer};
 use crate::file_traits::{AsyncFileReadWriteVolatile, FileReadWriteVolatile};
@@ -132,7 +131,7 @@ impl<F: AsyncFileSystem + Sync> Server<F> {
         let in_header = r.read_obj().map_err(Error::DecodeMessage)?;
         let mut ctx = SrvContext::<F, S, W>::new(in_header, r, w);
         self.remap_ctx_ids(&mut ctx)?;
-        if ctx.in_header.len > (MAX_BUFFER_SIZE + BUFFER_HEADER_SIZE)
+        if ctx.in_header.len > (self.max_buffer_size() + BUFFER_HEADER_SIZE)
             || ctx.w.available_bytes() < size_of::<OutHeader>()
         {
             return ctx
@@ -201,6 +200,8 @@ impl<F: AsyncFileSystem + Sync> Server<F> {
             x if x == Opcode::Rename2 as u32 => self.rename2(ctx),
             #[cfg(target_os = "linux")]
             x if x == Opcode::Lseek as u32 => self.lseek(ctx),
+            #[cfg(target_os = "linux")]
+            x if x == Opcode::CopyFileRange as u32 => self.copy_file_range(ctx),
             #[cfg(feature = "virtiofs")]
             x if x == Opcode::SetupMapping as u32 => self.setupmapping(ctx, vu_req),
             #[cfg(feature = "virtiofs")]
@@ -411,7 +412,7 @@ impl<F: AsyncFileSystem + Sync> Server<F> {
             ..
         } = ctx.r.read_obj().map_err(Error::DecodeMessage)?;
 
-        if size > MAX_BUFFER_SIZE {
+        if size > self.max_buffer_size() {
             return ctx
                 .async_reply_error(io::Error::from_raw_os_error(libc::ENOMEM))
                 .await;

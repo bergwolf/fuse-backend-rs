@@ -268,6 +268,13 @@ macro_rules! volatile_impl {
             }
 
             fn read_vectored_volatile(&mut self, bufs: &[FileVolatileSlice]) -> Result<usize> {
+                // Fast path: a single buffer (always the case for the fusedev
+                // transport) needs no iovec array, so skip its heap allocation
+                // and use the plain syscall.
+                if let [slice] = bufs {
+                    return self.read_volatile(*slice);
+                }
+
                 let iovecs: Vec<libc::iovec> = bufs
                     .iter()
                     .map(|s| libc::iovec {
@@ -309,6 +316,13 @@ macro_rules! volatile_impl {
             }
 
             fn write_vectored_volatile(&mut self, bufs: &[FileVolatileSlice]) -> Result<usize> {
+                // Fast path: a single buffer (always the case for the fusedev
+                // transport) needs no iovec array, so skip its heap allocation
+                // and use the plain syscall.
+                if let [slice] = bufs {
+                    return self.write_volatile(*slice);
+                }
+
                 let iovecs: Vec<libc::iovec> = bufs
                     .iter()
                     .map(|s| libc::iovec {
@@ -355,6 +369,13 @@ macro_rules! volatile_impl {
                 bufs: &[FileVolatileSlice],
                 offset: u64,
             ) -> Result<usize> {
+                // Fast path: a single buffer (always the case for the fusedev
+                // transport) needs no iovec array, so skip its heap allocation
+                // and use the plain syscall.
+                if let [slice] = bufs {
+                    return self.read_at_volatile(*slice, offset);
+                }
+
                 let iovecs: Vec<libc::iovec> = bufs
                     .iter()
                     .map(|s| libc::iovec {
@@ -413,6 +434,13 @@ macro_rules! volatile_impl {
                 bufs: &[FileVolatileSlice],
                 offset: u64,
             ) -> Result<usize> {
+                // Fast path: a single buffer (always the case for the fusedev
+                // transport) needs no iovec array, so skip its heap allocation
+                // and use the plain syscall.
+                if let [slice] = bufs {
+                    return self.write_at_volatile(*slice, offset);
+                }
+
                 let iovecs: Vec<libc::iovec> = bufs
                     .iter()
                     .map(|s| libc::iovec {
@@ -1327,5 +1355,42 @@ mod tests {
 
         file.read_exact_at_volatile(slice, 30).unwrap_err();
         file.read_exact_at_volatile(slice, 32).unwrap_err();
+    }
+
+    #[test]
+    fn test_vectored_volatile_single_buffer() {
+        let mut file = tempfile::tempfile().unwrap();
+
+        let mut buf = [0xfu8; 32];
+        let slice =
+            unsafe { FileVolatileSlice::from_raw_ptr(buf.as_mut_ptr() as *mut u8, buf.len()) };
+        assert_eq!(file.write_vectored_volatile(&[slice]).unwrap(), 32);
+        let mut buf1 = [0xau8; 16];
+        let slice1 =
+            unsafe { FileVolatileSlice::from_raw_ptr(buf1.as_mut_ptr() as *mut u8, buf1.len()) };
+        assert_eq!(file.write_vectored_at_volatile(&[slice1], 32).unwrap(), 16);
+
+        let mut buf2 = [0x0u8; 48];
+        let slice2 =
+            unsafe { FileVolatileSlice::from_raw_ptr(buf2.as_mut_ptr() as *mut u8, buf2.len()) };
+        assert_eq!(file.read_vectored_at_volatile(&[slice2], 0).unwrap(), 48);
+        assert_eq!(buf2[..32], buf);
+        assert_eq!(buf2[32..], buf1);
+        assert_eq!(file.read_vectored_at_volatile(&[slice2], 40).unwrap(), 8);
+
+        file.seek(SeekFrom::Start(0)).unwrap();
+        let mut buf3 = [0x0u8; 48];
+        let slice3 =
+            unsafe { FileVolatileSlice::from_raw_ptr(buf3.as_mut_ptr() as *mut u8, buf3.len()) };
+        assert_eq!(file.read_vectored_volatile(&[slice3]).unwrap(), 48);
+        assert_eq!(buf3[..32], buf);
+        assert_eq!(buf3[32..], buf1);
+        assert_eq!(file.read_vectored_volatile(&[slice3]).unwrap(), 0);
+
+        // No buffers at all transfer nothing.
+        assert_eq!(file.read_vectored_volatile(&[]).unwrap(), 0);
+        assert_eq!(file.write_vectored_volatile(&[]).unwrap(), 0);
+        assert_eq!(file.read_vectored_at_volatile(&[], 0).unwrap(), 0);
+        assert_eq!(file.write_vectored_at_volatile(&[], 0).unwrap(), 0);
     }
 }

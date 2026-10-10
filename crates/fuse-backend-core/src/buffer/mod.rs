@@ -115,16 +115,23 @@ impl std::error::Error for Error {}
 /// transport-specific writers. Transports construct it from their own
 /// buffers via [`IoBuffers::new`] and drive it through the public
 /// consumption/marking methods.
+///
+/// The first buffer is stored inline and only the remaining ones live in a
+/// `VecDeque`, so a contiguous request buffer (the `/dev/fuse` case) is
+/// tracked without any heap allocation.
 #[derive(Clone)]
 pub struct IoBuffers<'a, S> {
-    buffers: VecDeque<VolatileSlice<'a, S>>,
+    // Invariant: `head` is `None` only if `rest` is empty.
+    head: Option<VolatileSlice<'a, S>>,
+    rest: VecDeque<VolatileSlice<'a, S>>,
     bytes_consumed: usize,
 }
 
 impl<S: BitmapSlice> Default for IoBuffers<'_, S> {
     fn default() -> Self {
         IoBuffers {
-            buffers: VecDeque::new(),
+            head: None,
+            rest: VecDeque::new(),
             bytes_consumed: 0,
         }
     }
@@ -135,9 +142,51 @@ impl<'a, S: BitmapSlice> IoBuffers<'a, S> {
     ///
     /// The returned object starts with zero bytes consumed.
     pub fn new(slices: Vec<VolatileSlice<'a, S>>) -> Self {
+        let mut rest: VecDeque<_> = slices.into();
         IoBuffers {
-            buffers: slices.into(),
+            head: rest.pop_front(),
+            rest,
             bytes_consumed: 0,
+        }
+    }
+
+    /// Create an `IoBuffers` from a single contiguous volatile slice without
+    /// allocating.
+    ///
+    /// The returned object starts with zero bytes consumed.
+    pub fn from_slice(slice: VolatileSlice<'a, S>) -> Self {
+        IoBuffers {
+            head: Some(slice),
+            rest: VecDeque::new(),
+            bytes_consumed: 0,
+        }
+    }
+
+    fn iter(&self) -> impl Iterator<Item = &VolatileSlice<'a, S>> {
+        self.head.iter().chain(self.rest.iter())
+    }
+
+    fn len(&self) -> usize {
+        self.head.is_some() as usize + self.rest.len()
+    }
+
+    fn pop_front(&mut self) -> Option<VolatileSlice<'a, S>> {
+        let front = self.head.take();
+        self.head = self.rest.pop_front();
+        front
+    }
+
+    fn push_front(&mut self, buf: VolatileSlice<'a, S>) {
+        if let Some(old) = self.head.replace(buf) {
+            self.rest.push_front(old);
+        }
+    }
+
+    fn push_back(&mut self, buf: VolatileSlice<'a, S>) {
+        if self.head.is_none() {
+            self.head = Some(buf);
+        } else {
+            self.rest.push_back(buf);
         }
     }
 
@@ -146,9 +195,7 @@ impl<'a, S: BitmapSlice> IoBuffers<'a, S> {
         // This is guaranteed not to overflow because the total length of the chain
         // is checked during all creations of `IoBuffers` (see
         // `Reader::new()` and `Writer::new()`).
-        self.buffers
-            .iter()
-            .fold(0usize, |count, buf| count + buf.len())
+        self.iter().fold(0usize, |count, buf| count + buf.len())
     }
 
     /// Return the number of bytes already consumed.
@@ -158,9 +205,9 @@ impl<'a, S: BitmapSlice> IoBuffers<'a, S> {
 
     pub(crate) fn allocate_file_volatile_slice(&self, count: usize) -> Vec<FileVolatileSlice<'_>> {
         let mut rem = count;
-        let mut bufs: Vec<FileVolatileSlice> = Vec::with_capacity(self.buffers.len());
+        let mut bufs: Vec<FileVolatileSlice> = Vec::with_capacity(self.len());
 
-        for buf in &self.buffers {
+        for buf in self.iter() {
             if rem == 0 {
                 break;
             }
@@ -185,9 +232,9 @@ impl<'a, S: BitmapSlice> IoBuffers<'a, S> {
     #[cfg(feature = "async-io")]
     pub(crate) unsafe fn prepare_io_buf(&self, count: usize) -> Vec<FileVolatileBuf> {
         let mut rem = count;
-        let mut bufs = Vec::with_capacity(self.buffers.len());
+        let mut bufs = Vec::with_capacity(self.len());
 
-        for buf in &self.buffers {
+        for buf in self.iter() {
             if rem == 0 {
                 break;
             }
@@ -227,9 +274,9 @@ impl<'a, S: BitmapSlice> IoBuffers<'a, S> {
     #[cfg(feature = "async-io")]
     pub unsafe fn prepare_mut_io_buf(&self, count: usize) -> Vec<FileVolatileBuf> {
         let mut rem = count;
-        let mut bufs = Vec::with_capacity(self.buffers.len());
+        let mut bufs = Vec::with_capacity(self.len());
 
-        for buf in &self.buffers {
+        for buf in self.iter() {
             if rem == 0 {
                 break;
             }
@@ -259,7 +306,7 @@ impl<'a, S: BitmapSlice> IoBuffers<'a, S> {
     pub fn mark_dirty(&self, count: usize) {
         let mut rem = count;
 
-        for buf in &self.buffers {
+        for buf in self.iter() {
             if rem == 0 {
                 break;
             }
@@ -294,12 +341,12 @@ impl<'a, S: BitmapSlice> IoBuffers<'a, S> {
                 })?;
 
         let mut rem = bytes_consumed;
-        while let Some(buf) = self.buffers.pop_front() {
+        while let Some(buf) = self.pop_front() {
             if rem < buf.len() {
                 // Split the slice and push the remainder back into the buffer list. Safe because we
                 // know that `rem` is not out of bounds due to the check and we checked the bounds
                 // on `buf` when we added it to the buffer list.
-                self.buffers.push_front(buf.offset(rem).unwrap());
+                self.push_front(buf.offset(rem).unwrap());
                 break;
             }
 
@@ -325,17 +372,29 @@ impl<'a, S: BitmapSlice> IoBuffers<'a, S> {
     where
         F: FnOnce(&[FileVolatileSlice]) -> io::Result<usize>,
     {
-        let bufs = self.allocate_file_volatile_slice(count);
-        if bufs.is_empty() {
-            Ok(0)
-        } else {
-            let bytes_consumed = f(&bufs)?;
-            if mark_dirty {
-                self.mark_dirty(bytes_consumed);
+        let bytes_consumed = match &self.head {
+            None => return Ok(0),
+            _ if count == 0 => return Ok(0),
+            // Fast path: the first buffer covers the whole request (always the
+            // case for contiguous buffers), so hand out a single slice from the
+            // stack instead of collecting the slices into a `Vec`.
+            Some(head) if count <= head.len() || self.rest.is_empty() => {
+                let len = cmp::min(count, head.len());
+                // Safe because `len <= head.len()`.
+                let buf = FileVolatileSlice::from_volatile_slice(&head.subslice(0, len).unwrap());
+                f(std::slice::from_ref(&buf))?
             }
-            self.mark_used(bytes_consumed)?;
-            Ok(bytes_consumed)
+            Some(_) => {
+                let bufs = self.allocate_file_volatile_slice(count);
+                f(&bufs)?
+            }
+        };
+
+        if mark_dirty {
+            self.mark_dirty(bytes_consumed);
         }
+        self.mark_used(bytes_consumed)?;
+        Ok(bytes_consumed)
     }
 
     pub(crate) fn consume_for_read<F>(&mut self, count: usize, f: F) -> io::Result<usize>
@@ -365,7 +424,7 @@ impl<'a, S: BitmapSlice> IoBuffers<'a, S> {
     /// bytes.
     pub fn split_at(&mut self, offset: usize) -> Result<Self> {
         let mut rem = offset;
-        let pos = self.buffers.iter().position(|buf| {
+        let pos = self.iter().position(|buf| {
             if rem < buf.len() {
                 true
             } else {
@@ -375,26 +434,33 @@ impl<'a, S: BitmapSlice> IoBuffers<'a, S> {
         });
 
         if let Some(at) = pos {
-            let mut other = self.buffers.split_off(at);
+            let mut other = if at == 0 {
+                IoBuffers {
+                    head: self.head.take(),
+                    rest: std::mem::take(&mut self.rest),
+                    bytes_consumed: 0,
+                }
+            } else {
+                // `at - 1` indexes `rest` because `head` is buffer 0.
+                let mut rest = self.rest.split_off(at - 1);
+                IoBuffers {
+                    head: rest.pop_front(),
+                    rest,
+                    bytes_consumed: 0,
+                }
+            };
 
             if rem > 0 {
                 // There must be at least one element in `other` because we checked
                 // its `size` value in the call to `position` above.
-                let front = other.pop_front().expect("empty VecDeque after split");
-                self.buffers
-                    .push_back(front.subslice(0, rem).map_err(Error::VolatileMemoryError)?);
+                let front = other.pop_front().expect("empty IoBuffers after split");
+                self.push_back(front.subslice(0, rem).map_err(Error::VolatileMemoryError)?);
                 other.push_front(front.offset(rem).map_err(Error::VolatileMemoryError)?);
             }
 
-            Ok(IoBuffers {
-                buffers: other,
-                bytes_consumed: 0,
-            })
+            Ok(other)
         } else if rem == 0 {
-            Ok(IoBuffers {
-                buffers: VecDeque::new(),
-                bytes_consumed: 0,
-            })
+            Ok(IoBuffers::default())
         } else {
             Err(Error::SplitOutOfBounds(offset))
         }
@@ -431,7 +497,9 @@ impl<'a, S: BitmapSlice + Default> Reader<'a, S> {
         // Safe because Reader has the same lifetime as buf.
         let slice =
             unsafe { VolatileSlice::with_bitmap(buf.as_mut_ptr(), buf.len(), S::default(), None) };
-        Reader::from_volatile_slices(vec![slice])
+        Reader {
+            buffers: IoBuffers::from_slice(slice),
+        }
     }
 }
 
@@ -723,10 +791,7 @@ mod tests {
             bufs.push_back(VolatileSlice::new(buf1.as_mut_ptr(), buf1.len()));
             bufs.push_back(VolatileSlice::new(buf2.as_mut_ptr(), buf2.len()));
         }
-        let mut buffers = IoBuffers {
-            buffers: bufs,
-            bytes_consumed: 0,
-        };
+        let mut buffers = IoBuffers::new(bufs.into());
 
         assert_eq!(buffers.available_bytes(), 32);
         assert_eq!(buffers.bytes_consumed(), 0);
@@ -789,10 +854,7 @@ mod tests {
                 None,
             ));
         }
-        let mut buffers = IoBuffers {
-            buffers: bufs,
-            bytes_consumed: 0,
-        };
+        let mut buffers = IoBuffers::new(bufs.into());
 
         assert_eq!(buffers.available_bytes(), 32);
         assert_eq!(buffers.bytes_consumed(), 0);
@@ -832,5 +894,69 @@ mod tests {
                 assert_eq!(bitmap2.is_bit_set(i), false);
             }
         }
+    }
+
+    #[test]
+    fn test_io_buffers_single_slice() {
+        let mut buf = (0u8..32).collect::<Vec<_>>();
+        let slice = unsafe { VolatileSlice::new(buf.as_mut_ptr(), buf.len()) };
+        let mut buffers = IoBuffers::from_slice(slice);
+        assert_eq!(buffers.available_bytes(), 32);
+
+        // Zero-length consumption doesn't call the closure.
+        assert_eq!(
+            buffers
+                .consume_for_read(0, |_| panic!("unexpected call"))
+                .unwrap(),
+            0
+        );
+
+        // Requests are clamped to the available bytes.
+        assert_eq!(
+            buffers
+                .consume_for_read(4, |bufs| {
+                    assert_eq!(bufs.len(), 1);
+                    assert_eq!(bufs[0].len(), 4);
+                    Ok(bufs[0].len())
+                })
+                .unwrap(),
+            4
+        );
+        assert_eq!(buffers.available_bytes(), 28);
+        assert_eq!(buffers.bytes_consumed(), 4);
+
+        let mut tail = buffers.split_at(8).unwrap();
+        assert_eq!(buffers.available_bytes(), 8);
+        assert_eq!(tail.available_bytes(), 20);
+        assert_eq!(
+            tail.consume_for_read(100, |bufs| {
+                assert_eq!(bufs.len(), 1);
+                let mut first = [0u8; 1];
+                bufs[0].as_volatile_slice().copy_to(&mut first[..]);
+                assert_eq!(first[0], 12);
+                Ok(bufs[0].len())
+            })
+            .unwrap(),
+            20
+        );
+        assert_eq!(tail.available_bytes(), 0);
+        assert_eq!(
+            tail.consume_for_read(1, |_| panic!("unexpected call"))
+                .unwrap(),
+            0
+        );
+
+        // Splitting at the end leaves an empty remainder.
+        let empty = buffers.split_at(8).unwrap();
+        assert_eq!(empty.available_bytes(), 0);
+        assert_eq!(buffers.available_bytes(), 8);
+        assert!(buffers.split_at(9).is_err());
+
+        // Splitting at the start moves everything to the remainder.
+        let mut all = buffers.split_at(0).unwrap();
+        assert_eq!(buffers.available_bytes(), 0);
+        assert_eq!(all.available_bytes(), 8);
+        all.mark_used(8).unwrap();
+        assert_eq!(all.available_bytes(), 0);
     }
 }

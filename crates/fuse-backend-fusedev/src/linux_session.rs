@@ -9,14 +9,18 @@
 //! A FUSE session can have multiple FUSE channels so that FUSE requests are handled in parallel.
 
 use std::fs::{File, OpenOptions};
+use std::io;
 use std::ops::Deref;
+use std::os::fd::BorrowedFd;
 use std::os::unix::fs::PermissionsExt;
-use std::os::unix::io::AsRawFd;
+use std::os::unix::io::{AsRawFd, RawFd};
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, RwLock};
 
 use crate::{FuseChannelExt, FuseDevReaderExt, FuseSessionExt};
+use fuse_backend_core::abi::fuse_abi::{FuseBackingMap, InHeader, OutHeader, WriteIn};
+use fuse_backend_core::api::filesystem::BackingFileRegistry;
 use mio::{Events, Poll, Token, Waker};
 use nix::errno::Errno;
 use nix::fcntl::{fcntl, FcntlArg, FdFlag, OFlag};
@@ -64,6 +68,7 @@ pub struct FuseSession {
     // fusermount binary, default to fusermount3
     fusermount: String,
     mount_flags: Option<MsFlags>,
+    backing: Arc<FuseBackingRegistry>,
 }
 
 impl FuseSession {
@@ -106,6 +111,7 @@ impl FuseSession {
             fusermount: FUSERMOUNT_BIN.to_string(),
             allow_other: true,
             mount_flags: None,
+            backing: Arc::new(FuseBackingRegistry::default()),
         })
     }
 
@@ -139,7 +145,18 @@ impl FuseSession {
 
     /// Force setting the associated FUSE session file.
     pub fn set_fuse_file(&mut self, file: File) {
+        self.backing.set_file(&file);
         self.file = Some(file);
+    }
+
+    /// Get the FUSE passthrough backing file registry of the session.
+    ///
+    /// The registry may be obtained before the session is mounted, so that it can be handed to
+    /// the file system (e.g. `PassthroughFs::set_backing_registry()`) before serving starts; it
+    /// becomes functional once the session is mounted and the kernel negotiated
+    /// `FsOptions::PASSTHROUGH`.
+    pub fn backing_registry(&self) -> Arc<FuseBackingRegistry> {
+        self.backing.clone()
     }
 
     /// Set custom mount flags for the session.
@@ -206,6 +223,18 @@ impl FuseSession {
         self.bufsize
     }
 
+    /// Set the buffer size of the channels created by the session, the default is
+    /// `FUSE_KERN_BUF_PAGES` pages plus `FUSE_HEADER_SIZE` (1MB + 4K with 4K pages).
+    ///
+    /// Must be called before `mount()`: the size is also passed to the kernel as the `max_read`
+    /// mount option, so that read requests never exceed the buffer. To serve writes larger than
+    /// the default, raise the INIT `max_write` with `Server::set_max_write()` as well; the
+    /// buffer must hold `max_write + FUSE_HEADER_SIZE` bytes, or the kernel rejects reads from
+    /// the fuse device with `EINVAL`. Values smaller than the default are ignored.
+    pub fn set_bufsize(&mut self, bufsize: usize) {
+        self.bufsize = std::cmp::max(bufsize, FUSE_KERN_BUF_PAGES * pagesize() + FUSE_HEADER_SIZE);
+    }
+
     /// Mount the fuse mountpoint, building connection with the in kernel fuse driver.
     pub fn mount(&mut self) -> Result<()> {
         let mut flags = self
@@ -223,10 +252,12 @@ impl FuseSession {
             self.allow_other,
             self.target_mntns,
             &self.fusermount,
+            self.bufsize,
         )?;
 
         fcntl(file.as_raw_fd(), FcntlArg::F_SETFL(OFlag::O_NONBLOCK))
             .map_err(|e| SessionFailure(format!("set fd nonblocking: {e}")))?;
+        self.backing.set_file(&file);
         self.file = Some(file);
         self.keep_alive = socket;
 
@@ -235,6 +266,7 @@ impl FuseSession {
 
     /// Destroy a fuse session.
     pub fn umount(&mut self) -> Result<()> {
+        self.backing.clear();
         // If we have a keep_alive socket, just drop it,
         // and let fusermount do the unmount.
         if let (None, Some(file)) = (self.keep_alive.take(), self.file.take()) {
@@ -302,6 +334,67 @@ impl FuseSession {
     }
 }
 
+/// Registry of FUSE passthrough backing files of a [`FuseSession`], see
+/// [`FuseSession::backing_registry()`].
+///
+/// Backing files are registered and unregistered with the `FUSE_DEV_IOC_BACKING_OPEN` and
+/// `FUSE_DEV_IOC_BACKING_CLOSE` ioctls on the session's `/dev/fuse` file, which require
+/// `CAP_SYS_ADMIN`.
+#[derive(Debug, Default)]
+pub struct FuseBackingRegistry {
+    file: RwLock<Option<File>>,
+}
+
+// #define FUSE_DEV_IOC_BACKING_OPEN _IOW(FUSE_DEV_IOC_MAGIC, 1, struct fuse_backing_map)
+nix::ioctl_write_ptr!(fuse_dev_ioc_backing_open, 229, 1, FuseBackingMap);
+// #define FUSE_DEV_IOC_BACKING_CLOSE _IOW(FUSE_DEV_IOC_MAGIC, 2, uint32_t)
+nix::ioctl_write_ptr!(fuse_dev_ioc_backing_close, 229, 2, u32);
+
+impl FuseBackingRegistry {
+    fn set_file(&self, file: &File) {
+        match file.try_clone() {
+            Ok(file) => *self.file.write().unwrap() = Some(file),
+            Err(e) => {
+                warn!("fuse: failed to dup fuse fd for the passthrough backing registry: {e}");
+                self.clear();
+            }
+        }
+    }
+
+    fn clear(&self) {
+        *self.file.write().unwrap() = None;
+    }
+
+    fn with_file<T>(&self, f: impl FnOnce(&File) -> nix::Result<T>) -> io::Result<T> {
+        let file = self.file.read().unwrap();
+        let file = file
+            .as_ref()
+            .ok_or_else(|| io::Error::from_raw_os_error(libc::ENOTCONN))?;
+        f(file).map_err(io::Error::from)
+    }
+}
+
+impl BackingFileRegistry for FuseBackingRegistry {
+    fn open_backing(&self, fd: BorrowedFd<'_>) -> io::Result<u32> {
+        let map = FuseBackingMap {
+            fd: fd.as_raw_fd(),
+            ..Default::default()
+        };
+        // Safe because the kernel only reads `map`, which outlives the call.
+        let id =
+            self.with_file(|file| unsafe { fuse_dev_ioc_backing_open(file.as_raw_fd(), &map) })?;
+        Ok(id as u32)
+    }
+
+    fn close_backing(&self, backing_id: u32) -> io::Result<()> {
+        // Safe because the kernel only reads `backing_id`, which outlives the call.
+        self.with_file(|file| unsafe {
+            fuse_dev_ioc_backing_close(file.as_raw_fd(), &backing_id)
+        })?;
+        Ok(())
+    }
+}
+
 impl Drop for FuseSession {
     fn drop(&mut self) {
         let _ = self.umount();
@@ -318,6 +411,70 @@ impl FuseSessionExt for FuseSession {
     }
 }
 
+/// Offset of the data of a `FUSE_WRITE` request from the start of the request.
+const WRITE_DATA_OFFSET: usize = std::mem::size_of::<InHeader>() + std::mem::size_of::<WriteIn>();
+/// Offset of the reply buffer from the start of the request buffer, chosen so
+/// that the data of a `FUSE_READ` reply, which follows the `OutHeader`, starts
+/// at the same address as the data of a `FUSE_WRITE` request.
+const REPLY_OFFSET: usize = WRITE_DATA_OFFSET - std::mem::size_of::<OutHeader>();
+
+/// Buffer of a fuse channel, shared by the request and its reply.
+///
+/// The buffer is laid out so that the bulk data in both directions is page
+/// aligned: the data of a `FUSE_WRITE` request, which the kernel copies into
+/// the buffer after the `InHeader` and `WriteIn` headers, and the data of a
+/// `FUSE_READ` reply, which is read from the backend file into the buffer
+/// after the `OutHeader`. The kernel pins and maps the user pages of the
+/// buffer one by one when copying data to or from it, so an unaligned data
+/// area spans one more user page than necessary (two instead of one for a
+/// 4 KiB request), and copies to or from page aligned data are also cache
+/// line aligned, which is faster.
+struct FuseDevBuf {
+    buf: Vec<u8>,
+    // Offset of the request buffer in `buf`.
+    off: usize,
+    // Size of the request buffer and of the reply buffer.
+    size: usize,
+}
+
+impl FuseDevBuf {
+    fn new(size: usize) -> Self {
+        let page_size = pagesize();
+        let buf = vec![0x0u8; size + REPLY_OFFSET + page_size];
+        let data = buf.as_ptr() as usize + WRITE_DATA_OFFSET;
+        let off = (page_size - data % page_size) % page_size;
+        FuseDevBuf { buf, off, size }
+    }
+
+    /// Get the buffer to read a request from the fuse device into.
+    fn request_buf(&mut self) -> &mut [u8] {
+        &mut self.buf[self.off..self.off + self.size]
+    }
+
+    /// Get a reader for the request of `len` bytes read into the buffer, and
+    /// a writer to send the reply over `fd`.
+    fn split(&mut self, fd: RawFd, len: usize) -> (Reader<'_>, FuseDevWriter<'_>) {
+        // ###############################################
+        // Note: it's a heavy hack to reuse the same underlying data
+        // buffer for both Reader and Writer, in order to reduce memory
+        // consumption. Here we assume Reader won't be used anymore once
+        // we start to write to the Writer. To get rid of this hack,
+        // just allocate a dedicated data buffer for Writer.
+        let reply = unsafe {
+            std::slice::from_raw_parts_mut(
+                self.buf.as_mut_ptr().add(self.off + REPLY_OFFSET),
+                self.size,
+            )
+        };
+        // Reader::new() and Writer::new() should always return success.
+        let reader =
+            Reader::from_fuse_buffer(FuseBuf::new(&mut self.buf[self.off..self.off + len]))
+                .unwrap();
+        let writer = FuseDevWriter::new(fd, reply).unwrap();
+        (reader, writer)
+    }
+}
+
 /// A fuse channel abstraction.
 ///
 /// Each session can hold multiple channels.
@@ -325,7 +482,7 @@ pub struct FuseChannel {
     file: File,
     poll: Poll,
     waker: Arc<Waker>,
-    buf: Vec<u8>,
+    buf: FuseDevBuf,
     events: Events,
 }
 
@@ -369,7 +526,7 @@ impl FuseChannel {
             file,
             poll,
             waker,
-            buf: vec![0x0u8; bufsize],
+            buf: FuseDevBuf::new(bufsize),
             events: Events::with_capacity(POLL_EVENTS_CAPACITY),
         })
     }
@@ -419,23 +576,8 @@ impl FuseChannel {
             }
             if fusereq_available {
                 let fd = self.file.as_raw_fd();
-                match read(fd, &mut self.buf) {
-                    Ok(len) => {
-                        // ###############################################
-                        // Note: it's a heavy hack to reuse the same underlying data
-                        // buffer for both Reader and Writer, in order to reduce memory
-                        // consumption. Here we assume Reader won't be used anymore once
-                        // we start to write to the Writer. To get rid of this hack,
-                        // just allocate a dedicated data buffer for Writer.
-                        let buf = unsafe {
-                            std::slice::from_raw_parts_mut(self.buf.as_mut_ptr(), self.buf.len())
-                        };
-                        // Reader::new() and Writer::new() should always return success.
-                        let reader =
-                            Reader::from_fuse_buffer(FuseBuf::new(&mut self.buf[..len])).unwrap();
-                        let writer = FuseDevWriter::new(fd, buf).unwrap();
-                        return Ok(Some((reader, writer)));
-                    }
+                match read(fd, self.buf.request_buf()) {
+                    Ok(len) => return Ok(Some(self.buf.split(fd, len))),
                     Err(e) => match e {
                         Errno::ENOENT => {
                             // ENOENT means the operation was interrupted, it's safe to restart
@@ -479,14 +621,14 @@ impl FuseChannel {
 /// unaffected by the `O_NONBLOCK` flag set on the session fd.
 pub struct BlockingFuseChannel {
     file: File,
-    buf: Vec<u8>,
+    buf: FuseDevBuf,
 }
 
 impl BlockingFuseChannel {
     fn new(file: File, bufsize: usize) -> Self {
         BlockingFuseChannel {
             file,
-            buf: vec![0x0u8; bufsize],
+            buf: FuseDevBuf::new(bufsize),
         }
     }
 
@@ -501,23 +643,8 @@ impl BlockingFuseChannel {
     pub fn get_request(&mut self) -> Result<Option<(Reader<'_>, FuseDevWriter<'_>)>> {
         loop {
             let fd = self.file.as_raw_fd();
-            match read(fd, &mut self.buf) {
-                Ok(len) => {
-                    // ###############################################
-                    // Note: it's a heavy hack to reuse the same underlying data
-                    // buffer for both Reader and Writer, in order to reduce memory
-                    // consumption. Here we assume Reader won't be used anymore once
-                    // we start to write to the Writer. To get rid of this hack,
-                    // just allocate a dedicated data buffer for Writer.
-                    let buf = unsafe {
-                        std::slice::from_raw_parts_mut(self.buf.as_mut_ptr(), self.buf.len())
-                    };
-                    // Reader::new() and Writer::new() should always return success.
-                    let reader =
-                        Reader::from_fuse_buffer(FuseBuf::new(&mut self.buf[..len])).unwrap();
-                    let writer = FuseDevWriter::new(fd, buf).unwrap();
-                    return Ok(Some((reader, writer)));
-                }
+            match read(fd, self.buf.request_buf()) {
+                Ok(len) => return Ok(Some(self.buf.split(fd, len))),
                 Err(e) => match e {
                     Errno::ENOENT => {
                         // ENOENT means the operation was interrupted, it's safe to restart
@@ -569,6 +696,7 @@ fn fuse_kern_mount(
     allow_other: bool,
     target_mntns: Option<libc::pid_t>,
     fusermount: &str,
+    max_read: usize,
 ) -> Result<(File, Option<UnixStream>)> {
     let file = OpenOptions::new()
         .create(false)
@@ -589,7 +717,7 @@ fn fuse_kern_mount(
     // in virtiofs scene max_read can't be adjusted, his default is UINT_MAX, but we don't have to
     // worry about it, because the buffer is allocated by the kernel driver, we just use this buffer
     // to fill the response, so we don't need to do any adjustment.
-    let max_read = FUSE_KERN_BUF_PAGES * pagesize() + FUSE_HEADER_SIZE;
+    // `max_read` is the session buffer size, see `FuseSession::set_bufsize()`.
 
     let mut opts = format!(
         "default_permissions,fd={},rootmode={:o},user_id={},group_id={},max_read={}",

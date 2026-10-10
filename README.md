@@ -23,6 +23,8 @@ So the fuse-rs crate is a library to communicate with the Linux FUSE clients, wh
 - Transport layer, which supports both the Linux Fuse device and virtio-fs protocol.
 - VFS/pseudo_fs, an abstraction layer to support multiple file systems by a single virtio-fs device.
 - A sample passthrough file system implementation, which passes through files from daemons to clients. 
+  On Linux 6.9+ it can hand opened files to the kernel's FUSE passthrough (`FUSE_PASSTHROUGH`), so
+  reads and writes bypass the daemon (`passthrough::Config::fuse_passthrough`, needs `CAP_SYS_ADMIN`).
 
 ![arch](docs/images/fuse-backend-architecture.svg)
 
@@ -151,6 +153,13 @@ impl FuseServer {
     }
 }
 ```
+
+`FuseChannel` waits for requests with `epoll`, so that `FuseSession::wake()`
+can stop the service threads. For throughput, serve each thread from
+`FuseSession::new_blocking_channel()` instead (same `get_request()` loop): it
+reads its own cloned fuse device fd with plain blocking reads, which saves an
+`epoll_wait` syscall per request; the threads then exit when the session is
+umounted.
 
 ## License
 This project is licensed under
