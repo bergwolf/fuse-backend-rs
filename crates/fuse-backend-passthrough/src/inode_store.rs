@@ -1,14 +1,14 @@
 // Use of this source code is governed by a BSD-style license that can be
 // found in the LICENSE-BSD-3-Clause file.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
 
 use super::file_handle::FileHandle;
 use super::statx::StatExt;
 use super::{Inode, InodeData, InodeHandle};
 
-#[derive(Clone, Copy, Default, PartialOrd, Ord, PartialEq, Eq, Debug)]
+#[derive(Clone, Copy, Default, PartialOrd, Ord, PartialEq, Eq, Hash, Debug)]
 /// Identify an inode in `PassthroughFs` by `InodeId`.
 pub struct InodeId {
     pub ino: libc::ino64_t,
@@ -27,10 +27,13 @@ impl InodeId {
     }
 }
 
+// `data` is searched on almost every request and `by_id` several times per
+// lookup or create of a new file, so they are hash maps: a B-tree search over
+// a large store costs several dependent cache misses.
 #[derive(Default)]
 pub struct InodeStore {
-    data: BTreeMap<Inode, Arc<InodeData>>,
-    by_id: BTreeMap<InodeId, Inode>,
+    data: HashMap<Inode, Arc<InodeData>>,
+    by_id: HashMap<InodeId, Inode>,
     by_handle: BTreeMap<Arc<FileHandle>, Inode>,
 }
 
