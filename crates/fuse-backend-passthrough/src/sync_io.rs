@@ -865,16 +865,22 @@ impl<S: BitmapSlice + Send + Sync> FileSystem for PassthroughFs<S> {
 
     fn forget(&self, _ctx: &Context, inode: Inode, count: u64) {
         let mut inodes = self.inode_map.get_map_mut();
-
-        self.forget_one(&mut inodes, inode, count)
+        let forgotten = self.forget_one(&mut inodes, inode, count);
+        // Close the file of a forgotten inode outside of the lock, see forget_one().
+        drop(inodes);
+        drop(forgotten);
     }
 
     fn batch_forget(&self, _ctx: &Context, requests: Vec<(Inode, u64)>) {
         let mut inodes = self.inode_map.get_map_mut();
+        let mut forgotten = Vec::new();
 
         for (inode, count) in requests {
-            self.forget_one(&mut inodes, inode, count)
+            forgotten.extend(self.forget_one(&mut inodes, inode, count));
         }
+        // Close the files of forgotten inodes outside of the lock, see forget_one().
+        drop(inodes);
+        drop(forgotten);
     }
 
     fn opendir(
@@ -964,7 +970,9 @@ impl<S: BitmapSlice + Send + Sync> FileSystem for PassthroughFs<S> {
 
                 let entry = self.do_lookup(inode, name)?;
                 let mut inodes = self.inode_map.get_map_mut();
-                self.forget_one(&mut inodes, entry.inode, 1);
+                let forgotten = self.forget_one(&mut inodes, entry.inode, 1);
+                drop(inodes);
+                drop(forgotten);
                 entry.inode
             };
 
@@ -1002,7 +1010,9 @@ impl<S: BitmapSlice + Send + Sync> FileSystem for PassthroughFs<S> {
                 if r == 0 {
                     // Release the refcount acquired by self.do_lookup().
                     let mut inodes = self.inode_map.get_map_mut();
-                    self.forget_one(&mut inodes, ino, 1);
+                    let forgotten = self.forget_one(&mut inodes, ino, 1);
+                    drop(inodes);
+                    drop(forgotten);
                 }
             })
         })

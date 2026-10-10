@@ -962,10 +962,20 @@ impl<S: BitmapSlice + Send + Sync> PassthroughFs<S> {
         })
     }
 
-    fn forget_one(&self, inodes: &mut InodeStore, inode: Inode, count: u64) {
+    /// Drop `count` references to `inode`, returning its data if that was the last reference.
+    ///
+    /// The returned data holds the file of the inode, which callers should drop after releasing
+    /// the lock of `inodes`: closing the last reference to an unlinked file evicts it, which is
+    /// expensive and would stall the requests waiting for the lock.
+    fn forget_one(
+        &self,
+        inodes: &mut InodeStore,
+        inode: Inode,
+        count: u64,
+    ) -> Option<Arc<InodeData>> {
         // ROOT_ID should not be forgotten, or we're not able to access to files any more.
         if inode == fuse::ROOT_ID {
-            return;
+            return None;
         }
 
         if let Some(data) = inodes.get(&inode) {
@@ -991,12 +1001,13 @@ impl<S: BitmapSlice + Send + Sync> PassthroughFs<S> {
                         // The allocated inode number should be kept in the map when use_host_ino
                         // is false or host inode(don't use the virtual 56bit inode) is bigger than MAX_HOST_INO.
                         let keep_mapping = !self.cfg.use_host_ino || data.id.ino > MAX_HOST_INO;
-                        inodes.remove(&inode, keep_mapping);
+                        return inodes.remove(&inode, keep_mapping);
                     }
                     break;
                 }
             }
         }
+        None
     }
 
     fn do_release(&self, inode: Inode, handle: Handle) -> io::Result<()> {
