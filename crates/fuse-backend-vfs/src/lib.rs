@@ -715,9 +715,16 @@ impl Vfs {
         if inode.is_pseudo_fs() {
             // ROOT_ID is special, we need to check if we have a mountpoint on the vfs root
             if inode.ino() == ROOT_ID {
-                if let Some(mnt) = self.mountpoints.load().get(&inode.ino()).cloned() {
-                    let fs = self.get_fs_ref_by_idx(mnt.fs_idx)?;
-                    return Ok((Right(fs), VfsInode::new(mnt.fs_idx, mnt.ino)));
+                // Copy out the fields rather than cloning the `Arc`, whose
+                // refcount is shared by every request on the root directory.
+                let root_mnt = self
+                    .mountpoints
+                    .load()
+                    .get(&inode.ino())
+                    .map(|mnt| (mnt.fs_idx, mnt.ino));
+                if let Some((fs_idx, ino)) = root_mnt {
+                    let fs = self.get_fs_ref_by_idx(fs_idx)?;
+                    return Ok((Right(fs), VfsInode::new(fs_idx, ino)));
                 }
             }
             Ok((Left(&self.root), inode))
